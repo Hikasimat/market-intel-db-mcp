@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "market-intel-prospect-entry": {
+      "command": "C:\\PATH\\TO\\prospect-entry-server\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\PATH\\TO\\prospect-entry-server\\server.py"
+      ]
+    }
+  }
+}

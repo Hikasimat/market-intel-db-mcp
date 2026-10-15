@@ -1,0 +1,10 @@
+# Versions below are the ones this server was built and tested against (Python 3.14.2).
+mcp==2.3.0
+httpx==0.28.1
+pydantic==2.14.1
+python-dotenv==1.2.4
+
+# Test-only
+pytest==9.1.1
+pytest-asyncio==1.4.0
+respx==0.23.1

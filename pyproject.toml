@@ -1,0 +1,23 @@
+[project]
+name = "market-intel-prospect-entry-server"
+version = "0.1.0"
+description = "Restricted MCP server for entering new prospects into Market Intel DB via its existing Django API"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.3.0",
+  "httpx==0.28.1",
+  "pydantic==2.14.1",
+  "python-dotenv==1.2.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "respx==0.23.1"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "tests"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["integration: needs a real test backend (MI_INTEGRATION=1); never run against production"]
+
+[tool.setuptools]
+py-modules = []
