@@ -1,0 +1,263 @@
+
+name: Deploy Market Intel Prospect MCP
+
+on:
+  push:
+    branches:
+      - fix-architecture-security
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-intel-mcp-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Run MCP tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  deploy:
+    name: Build and deploy to AWS
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+      IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: MCPDeploy-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          docker build --pull -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Deploy container through Systems Manager
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${IMAGE_URI:?The image URI was not set}"
+
+          REMOTE_SCRIPT="$(cat <<'REMOTE'
+          set -Eeuo pipefail
+
+          AWS_REGION='__AWS_REGION__'
+          AWS_ACCOUNT_ID='__AWS_ACCOUNT_ID__'
+          IMAGE_URI='__IMAGE_URI__'
+
+          APP_DIR=/opt/market-intel-mcp
+          PARAMETER_NAME=/market-intel/mcp/production/env
+          CONTAINER_NAME=market-intel-prospect-entry-mcp
+
+          umask 077
+          install -d -m 750 "$APP_DIR"
+
+          TMP_ENV="$APP_DIR/.env.tmp"
+          trap 'rm -f "$TMP_ENV"' EXIT
+
+          aws ssm get-parameter \
+            --name "$PARAMETER_NAME" \
+            --with-decryption \
+            --query 'Parameter.Value' \
+            --output text \
+            --region "$AWS_REGION" > "$TMP_ENV"
+
+          test -s "$TMP_ENV"
+
+          if ! grep -q '^MCP_AUTH_TOKEN=.' "$TMP_ENV"; then
+            echo "MCP_AUTH_TOKEN is missing; refusing deployment." >&2
+            exit 1
+          fi
+
+          chmod 600 "$TMP_ENV"
+          mv "$TMP_ENV" "$APP_DIR/.env"
+          trap - EXIT
+
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
+
+          docker pull "$IMAGE_URI"
+
+          # Validate credentials and confirm the account has the PRE role.
+          docker run --rm \
+            --env-file "$APP_DIR/.env" \
+            "$IMAGE_URI" python server.py --check
+
+          # Remember the currently deployed image for recovery.
+          OLD_IMAGE="$(docker inspect \
+            --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+
+          start_container() {
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --env-file "$APP_DIR/.env" \
+              --publish 127.0.0.1:8001:8001 \
+              "$1" >/dev/null
+          }
+
+          restore_old_image() {
+            if [ -n "$OLD_IMAGE" ]; then
+              echo "Attempting to restore the previous image." >&2
+              start_container "$OLD_IMAGE" || true
+            fi
+          }
+
+          docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+          if ! start_container "$IMAGE_URI"; then
+            echo "New container failed to start." >&2
+            restore_old_image
+            exit 1
+          fi
+
+          # The MCP token middleware should reject unauthenticated requests.
+          HEALTHY=false
+
+          for attempt in $(seq 1 15); do
+            HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+              http://127.0.0.1:8001/mcp || true)"
+
+            if [ "$HTTP_CODE" = "401" ]; then
+              HEALTHY=true
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "$HEALTHY" != "true" ]; then
+            echo "MCP endpoint did not return the expected unauthenticated 401." >&2
+            docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
+
+            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            restore_old_image
+            exit 1
+          fi
+
+          echo "MCP container is running and authentication is enabled."
+          docker ps --filter "name=$CONTAINER_NAME"
+          REMOTE
+          )"
+
+          # Substitute deployment-specific values into the remote script.
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__AWS_REGION__/$AWS_REGION}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__AWS_ACCOUNT_ID__/$AWS_ACCOUNT_ID}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__IMAGE_URI__/$IMAGE_URI}"
+
+          # Base64 avoids JSON and shell quoting problems in SSM commands.
+          REMOTE_B64="$(printf '%s' "$REMOTE_SCRIPT" | base64 -w 0)"
+          SSM_COMMAND="printf '%s' '$REMOTE_B64' | base64 -d | sudo bash"
+
+          PARAMETERS="$(jq -n --arg command "$SSM_COMMAND" \
+            '{commands: [$command]}')"
+
+          COMMAND_ID="$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy MCP image ${IMAGE_TAG}" \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          echo "SSM deployment command submitted."
+
+          STATUS=""
+
+          for attempt in $(seq 1 90); do
+            STATUS="$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)"
+
+            case "$STATUS" in
+              Success)
+                break
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "SSM deployment failed: $STATUS" >&2
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query StandardErrorContent \
+                  --output text || true
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query StandardOutputContent \
+                  --output text || true
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Deployment did not finish successfully in time." >&2
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query StandardOutputContent \
+            --output text
