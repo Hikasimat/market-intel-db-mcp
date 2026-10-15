@@ -11,8 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Default port for SSE / HTTP transport
+# Default port for Streamable-HTTP / SSE transport
 EXPOSE 8001
 
-# Run as remote SSE server binding to all interfaces
-CMD ["python", "server.py", "--sse", "--host", "0.0.0.0", "--port", "8001"]
+# Run as remote Streamable-HTTP server (/mcp endpoint) binding to all interfaces
+CMD ["python", "server.py", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8001"]
+

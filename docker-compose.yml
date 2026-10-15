@@ -3,6 +3,7 @@ services:
     build: .
     container_name: market-intel-prospect-entry-mcp
     restart: unless-stopped
+    command: ["python", "server.py", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8001"]
     ports:
       - "8001:8001"
     env_file:
@@ -12,3 +13,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
