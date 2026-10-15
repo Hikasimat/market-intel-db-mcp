@@ -1,3 +1,4 @@
+
 name: Deploy Market Intel Prospect MCP
 
 on:
@@ -89,6 +90,9 @@ jobs:
           set -euo pipefail
 
           : "${IMAGE_URI:?The image URI was not set}"
+          : "${AWS_REGION:?AWS_REGION is missing}"
+          : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is missing}"
+          : "${EC2_INSTANCE_ID:?EC2_INSTANCE_ID is missing}"
 
           REMOTE_SCRIPT="$(cat <<'REMOTE'
           set -Eeuo pipefail
@@ -101,13 +105,17 @@ jobs:
           PARAMETER_NAME=/market-intel/mcp/production/env
           CONTAINER_NAME=market-intel-prospect-entry-mcp
 
+          # Existing Django API private route.
+          BACKEND_HOST=marketintel.hikasimat.com
+          BACKEND_PRIVATE_IP=10.0.3.3
+
           umask 077
           install -d -m 750 "$APP_DIR"
 
           TMP_ENV="$APP_DIR/.env.tmp"
           trap 'rm -f "$TMP_ENV"' EXIT
 
-          # Retrieve the encrypted configuration without printing its contents.
+          # Retrieve the SecureString without displaying its contents.
           aws ssm get-parameter \
             --name "$PARAMETER_NAME" \
             --with-decryption \
@@ -134,18 +142,15 @@ jobs:
 
           docker pull "$IMAGE_URI"
 
-          # Route the backend hostname to its private VPC IP.
-          # The HTTPS hostname remains unchanged for TLS validation.
-          BACKEND_HOST=marketintel.hikasimat.com
-          BACKEND_PRIVATE_IP=10.0.3.3
-
-          # Validate the PRE account before replacing the running container.
+          # Validate the API login before replacing the running container.
+          # The hostname remains unchanged, preserving HTTPS SNI and
+          # certificate hostname validation while bypassing public Cloudflare DNS.
           docker run --rm \
             --add-host "${BACKEND_HOST}:${BACKEND_PRIVATE_IP}" \
             --env-file "$APP_DIR/.env" \
             "$IMAGE_URI" python server.py --check
 
-          # Capture the previously deployed image for recovery.
+          # Record the existing image for potential rollback.
           OLD_IMAGE="$(docker inspect \
             --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
 
@@ -168,16 +173,17 @@ jobs:
             fi
           }
 
-          # Replace the container only after configuration and login checks pass.
+          # Replace the container only after the API check has passed.
           docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
           if ! start_container "$IMAGE_URI"; then
             echo "New container failed to start." >&2
+            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
             restore_old_image
             exit 1
           fi
 
-          # Check that the MCP authentication middleware rejects anonymous access.
+          # Check that the MCP endpoint rejects unauthenticated access.
           HEALTHY=false
 
           for attempt in $(seq 1 15); do
@@ -208,12 +214,12 @@ jobs:
           REMOTE
           )"
 
-          # Substitute deployment-specific values into the remote script.
+          # Substitute the deployment-specific values.
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__AWS_REGION__/$AWS_REGION}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__AWS_ACCOUNT_ID__/$AWS_ACCOUNT_ID}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__IMAGE_URI__/$IMAGE_URI}"
 
-          # Encode the script to avoid JSON and shell quoting problems.
+          # Encode the script to avoid JSON and shell-quoting issues.
           REMOTE_B64="$(printf '%s' "$REMOTE_SCRIPT" | base64 -w 0)"
           SSM_COMMAND="printf '%s' '$REMOTE_B64' | base64 -d | sudo bash"
 
