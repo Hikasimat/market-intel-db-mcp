@@ -1,4 +1,3 @@
-
 name: Deploy Market Intel Prospect MCP
 
 on:
@@ -108,6 +107,7 @@ jobs:
           TMP_ENV="$APP_DIR/.env.tmp"
           trap 'rm -f "$TMP_ENV"' EXIT
 
+          # Retrieve the encrypted configuration without printing its contents.
           aws ssm get-parameter \
             --name "$PARAMETER_NAME" \
             --with-decryption \
@@ -128,17 +128,24 @@ jobs:
 
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
+          # Authenticate to ECR using the EC2 instance role.
           aws ecr get-login-password --region "$AWS_REGION" |
             docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
 
           docker pull "$IMAGE_URI"
 
-          # Validate credentials and confirm the account has the PRE role.
+          # Route the backend hostname to its private VPC IP.
+          # The HTTPS hostname remains unchanged for TLS validation.
+          BACKEND_HOST=marketintel.hikasimat.com
+          BACKEND_PRIVATE_IP=10.0.3.3
+
+          # Validate the PRE account before replacing the running container.
           docker run --rm \
+            --add-host "${BACKEND_HOST}:${BACKEND_PRIVATE_IP}" \
             --env-file "$APP_DIR/.env" \
             "$IMAGE_URI" python server.py --check
 
-          # Remember the currently deployed image for recovery.
+          # Capture the previously deployed image for recovery.
           OLD_IMAGE="$(docker inspect \
             --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
 
@@ -148,6 +155,7 @@ jobs:
               --restart unless-stopped \
               --log-opt max-size=10m \
               --log-opt max-file=3 \
+              --add-host "${BACKEND_HOST}:${BACKEND_PRIVATE_IP}" \
               --env-file "$APP_DIR/.env" \
               --publish 127.0.0.1:8001:8001 \
               "$1" >/dev/null
@@ -160,6 +168,7 @@ jobs:
             fi
           }
 
+          # Replace the container only after configuration and login checks pass.
           docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
           if ! start_container "$IMAGE_URI"; then
@@ -168,11 +177,13 @@ jobs:
             exit 1
           fi
 
-          # The MCP token middleware should reject unauthenticated requests.
+          # Check that the MCP authentication middleware rejects anonymous access.
           HEALTHY=false
 
           for attempt in $(seq 1 15); do
             HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+              --connect-timeout 3 \
+              --max-time 5 \
               http://127.0.0.1:8001/mcp || true)"
 
             if [ "$HTTP_CODE" = "401" ]; then
@@ -202,7 +213,7 @@ jobs:
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__AWS_ACCOUNT_ID__/$AWS_ACCOUNT_ID}"
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__IMAGE_URI__/$IMAGE_URI}"
 
-          # Base64 avoids JSON and shell quoting problems in SSM commands.
+          # Encode the script to avoid JSON and shell quoting problems.
           REMOTE_B64="$(printf '%s' "$REMOTE_SCRIPT" | base64 -w 0)"
           SSM_COMMAND="printf '%s' '$REMOTE_B64' | base64 -d | sudo bash"
 
@@ -234,16 +245,19 @@ jobs:
                 ;;
               Failed|Cancelled|TimedOut)
                 echo "SSM deployment failed: $STATUS" >&2
+
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$EC2_INSTANCE_ID" \
                   --query StandardErrorContent \
                   --output text || true
+
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$EC2_INSTANCE_ID" \
                   --query StandardOutputContent \
                   --output text || true
+
                 exit 1
                 ;;
             esac
