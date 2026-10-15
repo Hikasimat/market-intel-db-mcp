@@ -148,6 +148,118 @@ class TokenAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+class DefaultPublicClientAuthMethodMiddleware:
+    """ASGI middleware for dynamic client registration (/register).
+
+    If an OAuth client (like Claude's automatic client registration) omits
+    `token_endpoint_auth_method`, default it to 'none' so that public clients
+    can exchange authorization codes using PKCE S256 without needing a client secret.
+    """
+    def __init__(self, app: Any):
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and scope.get("path") == "/register" and scope.get("method") == "POST":
+            import json
+            body_chunks = []
+            more_body = True
+            while more_body:
+                message = await receive()
+                if message.get("type") == "http.request":
+                    body_chunks.append(message.get("body", b""))
+                    more_body = message.get("more_body", False)
+            body = b"".join(body_chunks)
+
+            try:
+                data = json.loads(body.decode("utf-8")) if body else {}
+                if isinstance(data, dict) and not data.get("token_endpoint_auth_method"):
+                    data["token_endpoint_auth_method"] = "none"
+                    body = json.dumps(data).encode("utf-8")
+            except Exception:
+                pass
+
+            headers = [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"content-length"]
+            headers.append((b"content-length", str(len(body)).encode("ascii")))
+            scope = dict(scope)
+            scope["headers"] = headers
+
+            async def new_receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            await self.app(scope, new_receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def configure_oauth_endpoints(app: Any, issuer_url: str) -> None:
+    """Configure standards-compliant OAuth 2.0 metadata and Protected Resource endpoints."""
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Route
+    from mcp.shared.auth import OAuthMetadata, ProtectedResourceMetadata
+    from mcp.server.auth.json_response import PydanticJSONResponse
+
+    issuer_clean = issuer_url.rstrip("/")
+
+    # RFC 8414 OAuth 2.0 Authorization Server Metadata
+    metadata = OAuthMetadata.model_validate({
+        "issuer": issuer_clean,
+        "authorization_endpoint": f"{issuer_clean}/authorize",
+        "token_endpoint": f"{issuer_clean}/token",
+        "registration_endpoint": f"{issuer_clean}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+        "code_challenge_methods_supported": ["S256"],
+        "client_id_metadata_document_supported": True,
+    })
+
+    async def metadata_handler(request: Request) -> Response:
+        return PydanticJSONResponse(
+            content=metadata,
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    # RFC 9728 OAuth 2.0 Protected Resource Metadata
+    res_metadata = ProtectedResourceMetadata.model_validate({
+        "resource": f"{issuer_clean}/mcp",
+        "authorization_servers": [issuer_clean],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [],
+    })
+
+    async def pr_metadata_handler(request: Request) -> Response:
+        return PydanticJSONResponse(
+            content=res_metadata,
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    # Replace existing metadata route in place
+    for i, r in enumerate(app.routes):
+        if getattr(r, "path", "") == "/.well-known/oauth-authorization-server":
+            app.routes[i] = Route(
+                "/.well-known/oauth-authorization-server",
+                endpoint=metadata_handler,
+                methods=["GET", "OPTIONS"],
+            )
+            break
+
+    # Provide RFC 9728 protected resource metadata at both root and /mcp paths
+    app.routes.append(
+        Route("/.well-known/oauth-protected-resource", endpoint=pr_metadata_handler, methods=["GET", "OPTIONS"])
+    )
+    app.routes.append(
+        Route("/.well-known/oauth-protected-resource/mcp", endpoint=pr_metadata_handler, methods=["GET", "OPTIONS"])
+    )
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Market Intel prospect-entry MCP server")
@@ -187,7 +299,7 @@ def main() -> None:
     if enable_oauth and args.transport != "stdio":
         if not issuer_url:
             issuer_url = f"http://{args.host}:{args.port}"
-        from pydantic import AnyUrl
+        issuer_url = issuer_url.rstrip("/")
         from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
         from oauth_store import OAuthStore
         from oauth_provider import SQLiteOAuthProvider
@@ -196,8 +308,8 @@ def main() -> None:
         oauth_store = OAuthStore(db_path)
         oauth_provider = SQLiteOAuthProvider(oauth_store, issuer_url)
         auth_settings = AuthSettings(
-            issuer_url=AnyUrl(issuer_url),
-            resource_server_url=AnyUrl(issuer_url),
+            issuer_url=issuer_url,
+            resource_server_url=f"{issuer_url}/mcp",
             validate_token_resource=False,
             client_registration_options=ClientRegistrationOptions(enabled=True),
         )
@@ -241,6 +353,9 @@ def main() -> None:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app(host=args.host)
+        if enable_oauth:
+            configure_oauth_endpoints(app, issuer_url)
+            app.add_middleware(DefaultPublicClientAuthMethodMiddleware)
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
@@ -262,6 +377,9 @@ def main() -> None:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.streamable_http_app(host=args.host)
+        if enable_oauth:
+            configure_oauth_endpoints(app, issuer_url)
+            app.add_middleware(DefaultPublicClientAuthMethodMiddleware)
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],

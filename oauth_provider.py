@@ -59,7 +59,9 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         return None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        log.info("Registering OAuth client: %s (%s)", client_info.client_id, client_info.client_name)
+        log.info("Registering OAuth client: %s (%s, auth_method=%s)", client_info.client_id, client_info.client_name, client_info.token_endpoint_auth_method)
+        if not client_info.token_endpoint_auth_method:
+            client_info.token_endpoint_auth_method = "none" if not client_info.client_secret else "client_secret_post"
         self.store.save_client(client_info)
 
     # ------------------------------------------------------------ Authorization
@@ -208,6 +210,10 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             resource=token_data.resource or self.issuer_url,
             subject=token_data.subject,
         )
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Verify token implementing the TokenVerifier protocol directly."""
+        return await self.load_access_token(token)
 
     # --------------------------------------------------------------- Revocation
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:

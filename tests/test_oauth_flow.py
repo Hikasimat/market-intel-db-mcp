@@ -203,3 +203,322 @@ async def test_login_view_get_and_post_success(tmp_store, dummy_settings):
 
         # Session should now be consumed
         assert tmp_store.get_auth_session("sess_test_123") is None
+
+
+@pytest.mark.asyncio
+async def test_oauth_store_auth_method_persistence(tmp_store):
+    """Verify that token_endpoint_auth_method is persisted and defaulted correctly."""
+    # 1. Explicit none (public client)
+    c_none = OAuthClientInformationFull(
+        client_id="client-none",
+        redirect_uris=[AnyUrl("https://claude.ai/callback")],
+        token_endpoint_auth_method="none",
+    )
+    tmp_store.save_client(c_none)
+    loaded_none = tmp_store.get_client("client-none")
+    assert loaded_none is not None
+    assert loaded_none.token_endpoint_auth_method == "none"
+    assert loaded_none.client_secret is None
+
+    # 2. Explicit client_secret_post (confidential client)
+    c_secret = OAuthClientInformationFull(
+        client_id="client-secret",
+        client_secret="sec123",
+        redirect_uris=[AnyUrl("https://example.com/callback")],
+        token_endpoint_auth_method="client_secret_post",
+    )
+    tmp_store.save_client(c_secret)
+    loaded_secret = tmp_store.get_client("client-secret")
+    assert loaded_secret is not None
+    assert loaded_secret.token_endpoint_auth_method == "client_secret_post"
+    assert loaded_secret.client_secret == "sec123"
+
+    # 3. Omitted token_endpoint_auth_method with no secret -> defaults to none
+    c_omitted = OAuthClientInformationFull(
+        client_id="client-omitted",
+        redirect_uris=[AnyUrl("https://claude.ai/callback")],
+    )
+    tmp_store.save_client(c_omitted)
+    loaded_omitted = tmp_store.get_client("client-omitted")
+    assert loaded_omitted is not None
+    assert loaded_omitted.token_endpoint_auth_method == "none"
+
+
+@pytest.mark.asyncio
+async def test_client_authenticator_allows_public_client(tmp_store, provider):
+    """Verify ClientAuthenticator accepts public clients without client secret."""
+    from mcp.server.auth.middleware.client_auth import ClientAuthenticator, AuthenticationError
+
+    c_pub = OAuthClientInformationFull(
+        client_id="pub-client-1",
+        redirect_uris=[AnyUrl("https://claude.ai/callback")],
+        token_endpoint_auth_method="none",
+    )
+    tmp_store.save_client(c_pub)
+
+    auth = ClientAuthenticator(provider)
+
+    class FakePublicRequest:
+        async def form(self):
+            return {"client_id": "pub-client-1"}
+        headers = {}
+
+    authenticated_client = await auth.authenticate_request(FakePublicRequest())
+    assert authenticated_client.client_id == "pub-client-1"
+    assert authenticated_client.token_endpoint_auth_method == "none"
+
+
+@pytest.mark.asyncio
+async def test_oauth_metadata_and_protected_resource_discovery(dummy_settings, tmp_store):
+    """Verify public OAuth authorization-server discovery and RFC 9728 protected resource metadata."""
+    from confirmation_store import ConfirmationStore
+    from workflow import Workflow
+    from api_client import MarketIntelClient
+    from server import create_mcp, configure_oauth_endpoints
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+
+    client_mock = MarketIntelClient(dummy_settings)
+    wf = Workflow(client_mock, ConfirmationStore(300), dummy_settings)
+    issuer = "https://marketintel-mcp.hikasimat.com"
+    provider = SQLiteOAuthProvider(tmp_store, issuer)
+    auth_settings = AuthSettings(
+        issuer_url=issuer,
+        resource_server_url=f"{issuer}/mcp",
+        validate_token_resource=False,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    )
+    mcp = create_mcp(lambda: wf, auth_settings=auth_settings, auth_server_provider=provider)
+    app = mcp.streamable_http_app()
+    configure_oauth_endpoints(app, issuer)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http_client:
+        # 1. Authorization server metadata
+        res = await http_client.get("/.well-known/oauth-authorization-server")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["issuer"] == "https://marketintel-mcp.hikasimat.com"
+        assert data["authorization_endpoint"] == "https://marketintel-mcp.hikasimat.com/authorize"
+        assert data["token_endpoint"] == "https://marketintel-mcp.hikasimat.com/token"
+        assert data["registration_endpoint"] == "https://marketintel-mcp.hikasimat.com/register"
+        assert "none" in data["token_endpoint_auth_methods_supported"]
+        assert "client_secret_post" in data["token_endpoint_auth_methods_supported"]
+        assert data["response_types_supported"] == ["code"]
+        assert "authorization_code" in data["grant_types_supported"]
+        assert "S256" in data["code_challenge_methods_supported"]
+        assert data["client_id_metadata_document_supported"] is True
+
+        # 2. Protected resource metadata (root path)
+        res_pr1 = await http_client.get("/.well-known/oauth-protected-resource")
+        assert res_pr1.status_code == 200
+        data_pr1 = res_pr1.json()
+        assert data_pr1["resource"] == "https://marketintel-mcp.hikasimat.com/mcp"
+        assert "https://marketintel-mcp.hikasimat.com" in data_pr1["authorization_servers"]
+
+        # 3. Protected resource metadata (/mcp path)
+        res_pr2 = await http_client.get("/.well-known/oauth-protected-resource/mcp")
+        assert res_pr2.status_code == 200
+        data_pr2 = res_pr2.json()
+        assert data_pr2["resource"] == "https://marketintel-mcp.hikasimat.com/mcp"
+        assert "https://marketintel-mcp.hikasimat.com" in data_pr2["authorization_servers"]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_client_registration_and_pkce_exchange_flow(dummy_settings, tmp_store):
+    """Verify full OAuth PKCE authorization-code exchange without client secret."""
+    import base64
+    import hashlib
+    from urllib.parse import urlparse, parse_qs
+    from confirmation_store import ConfirmationStore
+    from workflow import Workflow
+    from api_client import MarketIntelClient
+    from server import create_mcp, configure_oauth_endpoints, DefaultPublicClientAuthMethodMiddleware
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+
+    client_mock = MarketIntelClient(dummy_settings)
+    wf = Workflow(client_mock, ConfirmationStore(300), dummy_settings)
+    issuer = "https://marketintel-mcp.hikasimat.com"
+    provider = SQLiteOAuthProvider(tmp_store, issuer)
+    auth_settings = AuthSettings(
+        issuer_url=issuer,
+        resource_server_url=f"{issuer}/mcp",
+        validate_token_resource=False,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    )
+    mcp = create_mcp(lambda: wf, auth_settings=auth_settings, auth_server_provider=provider)
+    mcp.custom_route("/login", methods=["GET", "POST"])(create_login_handler(tmp_store, dummy_settings))
+    app = mcp.streamable_http_app()
+    configure_oauth_endpoints(app, issuer)
+    app.add_middleware(DefaultPublicClientAuthMethodMiddleware)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http_client:
+        # 1. Dynamic Client Registration (Claude omits token_endpoint_auth_method)
+        reg_resp = await http_client.post(
+            "/register",
+            json={
+                "client_name": "Claude Test Connector",
+                "redirect_uris": ["https://claude.ai/api/oauth/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+            },
+        )
+        assert reg_resp.status_code == 201
+        reg_data = reg_resp.json()
+        client_id = reg_data["client_id"]
+        assert reg_data["token_endpoint_auth_method"] == "none"
+        assert reg_data.get("client_secret") is None
+
+        # 2. PKCE code verifier and challenge
+        verifier = secrets.token_urlsafe(32)
+        sha = hashlib.sha256(verifier.encode("ascii")).digest()
+        challenge = base64.urlsafe_b64encode(sha).decode("ascii").rstrip("=")
+
+        # 3. GET /authorize
+        auth_url = f"/authorize?response_type=code&client_id={client_id}&redirect_uri=https://claude.ai/api/oauth/callback&code_challenge={challenge}&code_challenge_method=S256&state=state_abc"
+        auth_resp = await http_client.get(auth_url)
+        assert auth_resp.status_code == 302
+        login_url = auth_resp.headers["location"]
+        session_id = login_url.split("session_id=")[1]
+
+        # 4. POST /login with PRE user
+        with respx.mock(base_url=dummy_settings.api_base_url) as respx_mock:
+            respx_mock.post("/auth/login/").respond(200, json={"access": "django_acc", "refresh": "django_ref"})
+            respx_mock.get("/auth/me/").respond(200, json={"user": {"id": "u1", "username": "pre_user", "role": "PRE"}})
+
+            login_resp = await http_client.post(
+                "/login",
+                data={"session_id": session_id, "username": "pre_user", "password": "password"},
+            )
+            assert login_resp.status_code == 302
+            cb_url = login_resp.headers["location"]
+            parsed_cb = parse_qs(urlparse(cb_url).query)
+            code = parsed_cb["code"][0]
+            assert parsed_cb["state"][0] == "state_abc"
+
+        # 5. POST /token - Token exchange without secret
+        token_resp = await http_client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": "https://claude.ai/api/oauth/callback",
+            },
+        )
+        assert token_resp.status_code == 200
+        token_json = token_resp.json()
+        assert "access_token" in token_json
+        assert "refresh_token" in token_json
+        access_tok = token_json["access_token"]
+        refresh_tok = token_json["refresh_token"]
+
+        # 6. Reusing code must be rejected (single-use code)
+        reuse_resp = await http_client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": "https://claude.ai/api/oauth/callback",
+            },
+        )
+        assert reuse_resp.status_code == 400
+        assert reuse_resp.json()["error"] == "invalid_grant"
+
+        # 7. Refresh token rotation
+        ref_resp = await http_client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": refresh_tok,
+            },
+        )
+        assert ref_resp.status_code == 200
+        new_ref_json = ref_resp.json()
+        assert new_ref_json["access_token"] != access_tok
+        assert new_ref_json["refresh_token"] != refresh_tok
+
+        # 8. Reusing old refresh token must be rejected
+        old_ref_reuse = await http_client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": refresh_tok,
+            },
+        )
+        assert old_ref_reuse.status_code == 400
+        assert old_ref_reuse.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_non_pre_role(dummy_settings, tmp_store):
+    """Verify accounts without the PRE role cannot complete OAuth login."""
+    tmp_store.save_auth_session(
+        session_id="sess_analyst",
+        client_id="cid",
+        redirect_uri="https://claude.ai/callback",
+        state="st",
+        code_challenge="chal",
+        scopes=["prospects:entry"],
+        resource=None,
+    )
+    handler = create_login_handler(tmp_store, dummy_settings)
+
+    with respx.mock(base_url=dummy_settings.api_base_url) as respx_mock:
+        respx_mock.post("/auth/login/").respond(200, json={"access": "acc", "refresh": "ref"})
+        respx_mock.get("/auth/me/").respond(200, json={"user": {"id": "u2", "username": "analyst_bob", "role": "ANALYST"}})
+
+        scope_post = {
+            "type": "http",
+            "method": "POST",
+            "path": "/login",
+            "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+            "query_string": b"",
+        }
+        async def receive():
+            return {"type": "http.request", "body": b"session_id=sess_analyst&username=analyst_bob&password=pass"}
+
+        req = Request(scope_post, receive=receive)
+        resp = await handler(req)
+        assert resp.status_code == 200  # Re-renders login with error
+        body_text = resp.body.decode()
+        assert "Only accounts with the PRE role are permitted" in body_text
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_on_mcp_and_token(dummy_settings, tmp_store):
+    """Verify CORS preflight OPTIONS requests return 200 OK with allowed origins and headers."""
+    from confirmation_store import ConfirmationStore
+    from workflow import Workflow
+    from api_client import MarketIntelClient
+    from server import create_mcp
+    from starlette.middleware.cors import CORSMiddleware
+
+    client_mock = MarketIntelClient(dummy_settings)
+    wf = Workflow(client_mock, ConfirmationStore(300), dummy_settings)
+    mcp = create_mcp(lambda: wf)
+    app = mcp.streamable_http_app()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=True,
+        expose_headers=["*"],
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http_client:
+        res = await http_client.options(
+            "/mcp",
+            headers={
+                "Origin": "https://claude.ai",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization,Content-Type,mcp-protocol-version",
+            },
+        )
+        assert res.status_code == 200
+        assert res.headers.get("access-control-allow-origin") == "https://claude.ai" or res.headers.get("access-control-allow-origin") == "*"
+

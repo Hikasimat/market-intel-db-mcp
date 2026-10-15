@@ -63,13 +63,15 @@ class OAuthStore:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000;")
         return conn
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL;")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS oauth_clients (
                     client_id TEXT PRIMARY KEY,
@@ -78,6 +80,9 @@ class OAuthStore:
                     redirect_uris_json TEXT,
                     grant_types_json TEXT,
                     scope TEXT,
+                    token_endpoint_auth_method TEXT,
+                    client_secret_expires_at REAL,
+                    client_id_issued_at REAL,
                     created_at REAL
                 );
 
@@ -131,17 +136,42 @@ class OAuthStore:
                     created_at REAL
                 );
             """)
+
+            # Safe schema migration for existing databases:
+            cur = conn.execute("PRAGMA table_info(oauth_clients)")
+            existing_cols = {row["name"] for row in cur.fetchall()}
+            if "token_endpoint_auth_method" not in existing_cols:
+                conn.execute("ALTER TABLE oauth_clients ADD COLUMN token_endpoint_auth_method TEXT")
+            if "client_secret_expires_at" not in existing_cols:
+                conn.execute("ALTER TABLE oauth_clients ADD COLUMN client_secret_expires_at REAL")
+            if "client_id_issued_at" not in existing_cols:
+                conn.execute("ALTER TABLE oauth_clients ADD COLUMN client_id_issued_at REAL")
+
+            # Backfill any existing clients with NULL token_endpoint_auth_method:
+            conn.execute("""
+                UPDATE oauth_clients
+                SET token_endpoint_auth_method = CASE
+                    WHEN client_secret IS NULL OR client_secret = '' THEN 'none'
+                    ELSE 'client_secret_post'
+                END
+                WHERE token_endpoint_auth_method IS NULL
+            """)
             conn.commit()
 
     # ------------------------------------------------------------- Clients
     def save_client(self, client: OAuthClientInformationFull) -> None:
         with self._get_connection() as conn:
             redirect_uris = [str(u) for u in client.redirect_uris] if client.redirect_uris else []
+            auth_method = client.token_endpoint_auth_method
+            if not auth_method:
+                auth_method = "none" if not client.client_secret else "client_secret_post"
+
             conn.execute(
                 """
                 INSERT OR REPLACE INTO oauth_clients (
-                    client_id, client_secret, client_name, redirect_uris_json, grant_types_json, scope, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    client_id, client_secret, client_name, redirect_uris_json, grant_types_json,
+                    scope, token_endpoint_auth_method, client_secret_expires_at, client_id_issued_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     client.client_id,
@@ -150,6 +180,9 @@ class OAuthStore:
                     json.dumps(redirect_uris),
                     json.dumps(client.grant_types),
                     client.scope,
+                    auth_method,
+                    client.client_secret_expires_at,
+                    client.client_id_issued_at,
                     time.time(),
                 ),
             )
@@ -163,12 +196,31 @@ class OAuthStore:
                 return None
             redirect_uris = [AnyUrl(u) for u in json.loads(row["redirect_uris_json"])] if row["redirect_uris_json"] else None
             grant_types = json.loads(row["grant_types_json"]) if row["grant_types_json"] else []
+            keys = row.keys()
+            auth_method = row["token_endpoint_auth_method"] if "token_endpoint_auth_method" in keys and row["token_endpoint_auth_method"] else None
+            if not auth_method:
+                auth_method = "none" if not row["client_secret"] else "client_secret_post"
+
+            client_secret_expires_at = (
+                float(row["client_secret_expires_at"])
+                if "client_secret_expires_at" in keys and row["client_secret_expires_at"] is not None
+                else None
+            )
+            client_id_issued_at = (
+                int(row["client_id_issued_at"])
+                if "client_id_issued_at" in keys and row["client_id_issued_at"] is not None
+                else None
+            )
+
             return OAuthClientInformationFull(
                 client_id=row["client_id"],
                 client_secret=row["client_secret"],
                 client_name=row["client_name"],
                 redirect_uris=redirect_uris,
                 grant_types=grant_types,
+                token_endpoint_auth_method=auth_method,
+                client_secret_expires_at=client_secret_expires_at,
+                client_id_issued_at=client_id_issued_at,
                 scope=row["scope"],
             )
 

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix-architecture-security
+      - fix-architecture-secuirity
   workflow_dispatch:
 
 permissions:
@@ -230,9 +231,21 @@ jobs:
               http://127.0.0.1:8001/.well-known/oauth-authorization-server \
               2>/dev/null || true)"
 
+            PR_CODE="$(curl -sS \
+              -o /dev/null \
+              -w '%{http_code}' \
+              --connect-timeout 3 \
+              --max-time 5 \
+              -H "Host: marketintel-mcp.hikasimat.com" \
+              -H "X-Forwarded-Proto: https" \
+              http://127.0.0.1:8001/.well-known/oauth-protected-resource/mcp \
+              2>/dev/null || true)"
+
             if [ "$HTTP_CODE" = "200" ] &&
+               [ "$PR_CODE" = "200" ] &&
                grep -q '"authorization_endpoint"' "$METADATA_FILE" &&
-               grep -q '"token_endpoint"' "$METADATA_FILE"; then
+               grep -q '"token_endpoint"' "$METADATA_FILE" &&
+               grep -q '"none"' "$METADATA_FILE"; then
               OAUTH_HEALTHY=true
               break
             fi
