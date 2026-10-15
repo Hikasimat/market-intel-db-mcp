@@ -198,7 +198,7 @@ def main() -> None:
         auth_settings = AuthSettings(
             issuer_url=AnyUrl(issuer_url),
             resource_server_url=AnyUrl(issuer_url),
-            validate_token_resource=True,
+            validate_token_resource=False,
             client_registration_options=ClientRegistrationOptions(enabled=True),
         )
 
@@ -239,7 +239,16 @@ def main() -> None:
         mcp.run(transport="stdio")
     elif args.transport == "sse":
         import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app(host=args.host)
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=True,
+            expose_headers=["*"],
+        )
         if enable_oauth:
             print(f"OAuth 2.0 Sign In ACTIVE at {issuer_url} (login route: {issuer_url}/login)", file=sys.stderr)
         elif auth_token:
@@ -251,7 +260,16 @@ def main() -> None:
         uvicorn.run(app, host=args.host, port=args.port, log_level=workflow.settings.log_level.lower())
     elif args.transport == "streamable-http":
         import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
         app = mcp.streamable_http_app(host=args.host)
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=True,
+            expose_headers=["*"],
+        )
         if enable_oauth:
             print(f"OAuth 2.0 Sign In ACTIVE at {issuer_url} (login route: {issuer_url}/login)", file=sys.stderr)
         elif auth_token:

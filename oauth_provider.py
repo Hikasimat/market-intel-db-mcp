@@ -122,7 +122,7 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             client_id=client.client_id,
             scopes=authorization_code.scopes,
             subject=authorization_code.subject or "",
-            resource=authorization_code.resource,
+            resource=authorization_code.resource or self.issuer_url,
             django_access_token=code_data.django_access_token,
             django_refresh_token=code_data.django_refresh_token,
             access_token_ttl=token_ttl,
@@ -178,7 +178,7 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             client_id=client.client_id,
             scopes=scopes or refresh_token.scopes,
             subject=refresh_token.subject or "",
-            resource=refresh_token.resource,
+            resource=refresh_token.resource or self.issuer_url,
             django_access_token=old_data.django_access_token,
             django_refresh_token=old_data.django_refresh_token,
             access_token_ttl=token_ttl,
@@ -205,7 +205,7 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             client_id=token_data.client_id,
             scopes=token_data.scopes,
             expires_at=int(token_data.expires_at) if token_data.expires_at else None,
-            resource=token_data.resource,
+            resource=token_data.resource or self.issuer_url,
             subject=token_data.subject,
         )
 
