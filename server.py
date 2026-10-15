@@ -8,11 +8,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from mcp.server.mcpserver import MCPServer  # mcp 2.x (renamed from FastMCP in 1.x)
 
-from api_client import AuthError, ApiError, MarketIntelClient
+from api_client import AuthError, ApiError, Identity, MarketIntelClient
 from config import ConfigError, load_settings
 from confirmation_store import ConfirmationStore
 from workflow import Workflow
@@ -35,8 +35,23 @@ key_contacts ([{prefix?, contact_name, designation, official_email?, phone_numbe
 shareholdings. Unsupported fields are rejected."""
 
 
-def create_mcp(get_workflow: Callable[[], Workflow]) -> MCPServer:
-    mcp = MCPServer("market-intel-prospect-entry", instructions=INSTRUCTIONS)
+def create_mcp(
+    get_workflow: Callable[[], Workflow | Awaitable[Workflow]],
+    auth_settings: Any = None,
+    auth_server_provider: Any = None,
+) -> MCPServer:
+    mcp = MCPServer(
+        "market-intel-prospect-entry",
+        instructions=INSTRUCTIONS,
+        auth=auth_settings,
+        auth_server_provider=auth_server_provider,
+    )
+
+    async def _resolve_wf() -> Workflow:
+        wf = get_workflow()
+        if asyncio.iscoroutine(wf):
+            return await wf
+        return wf
 
     @mcp.tool()
     async def search_existing_prospects(query: str, country: str | None = None, limit: int = 10) -> dict[str, Any]:
@@ -44,7 +59,8 @@ def create_mcp(get_workflow: Callable[[], Workflow]) -> MCPServer:
         Use it to spot possible duplicates and to find parent-company IDs. Returns minimal fields only.
         Results are limited to what this PRE account can see, so 'no match' does NOT prove the company is new;
         the backend performs the final global duplicate check at creation. Does not create anything."""
-        return await get_workflow().search(query, country, limit)
+        wf = await _resolve_wf()
+        return await wf.search(query, country, limit)
 
     @mcp.tool(description=(
         "Validate a NEW prospect WITHOUT creating it. Checks required fields, enums, formats, parent companies, "
@@ -54,7 +70,8 @@ def create_mcp(get_workflow: Callable[[], Workflow]) -> MCPServer:
         "one-time confirmation_token; show the summary to the user and ask for explicit approval before calling "
         "create_confirmed_prospect. Updating/deleting prospects is not available." + PROSPECT_FIELDS_HELP))
     async def validate_prospect_data(prospect: dict[str, Any]) -> dict[str, Any]:
-        return await get_workflow().validate(prospect)
+        wf = await _resolve_wf()
+        return await wf.validate(prospect)
 
     @mcp.tool()
     async def create_confirmed_prospect(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
@@ -62,7 +79,8 @@ def create_mcp(get_workflow: Callable[[], Workflow]) -> MCPServer:
         validation summary and explicitly approved creation; set user_has_explicitly_confirmed=true only then.
         Takes no new data: the reviewed payload is bound to the token (single-use, expires). Emails are re-verified
         and duplicates re-checked first. On a timeout the outcome is UNCERTAIN: do NOT retry; search first."""
-        return await get_workflow().create(confirmation_token, user_has_explicitly_confirmed)
+        wf = await _resolve_wf()
+        return await wf.create(confirmation_token, user_has_explicitly_confirmed)
 
     return mcp
 
@@ -142,6 +160,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8001, help="Port to listen on (default: 8001)")
     parser.add_argument("--auth-token", default=None,
                         help="Secret token required to access SSE/HTTP endpoints (or set MCP_AUTH_TOKEN in .env)")
+    parser.add_argument("--oauth", action="store_true", default=None,
+                        help="Enable OAuth 2.0 Sign In flow (or set MCP_OAUTH_ENABLED=true in .env)")
+    parser.add_argument("--issuer-url", default=None,
+                        help="Public HTTPS URL for OAuth (e.g. https://mcp.yourdomain.com)")
+    parser.add_argument("--db-path", default=None,
+                        help="Path to SQLite database for OAuth tokens/sessions (default: oauth.db)")
     args = parser.parse_args()
 
     if args.check:
@@ -153,29 +177,88 @@ def main() -> None:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    enable_oauth = args.oauth if args.oauth is not None else workflow.settings.oauth_enabled
+    issuer_url = args.issuer_url or workflow.settings.oauth_issuer_url
+
+    oauth_provider = None
+    auth_settings = None
+    oauth_store = None
+
+    if enable_oauth and args.transport != "stdio":
+        if not issuer_url:
+            issuer_url = f"http://{args.host}:{args.port}"
+        from pydantic import AnyUrl
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+        from oauth_store import OAuthStore
+        from oauth_provider import SQLiteOAuthProvider
+
+        db_path = args.db_path or workflow.settings.oauth_db_path
+        oauth_store = OAuthStore(db_path)
+        oauth_provider = SQLiteOAuthProvider(oauth_store, issuer_url)
+        auth_settings = AuthSettings(
+            issuer_url=AnyUrl(issuer_url),
+            resource_server_url=AnyUrl(issuer_url),
+            validate_token_resource=True,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+        )
+
+    shared_store = ConfirmationStore(workflow.settings.confirmation_ttl_seconds)
+
+    async def get_active_workflow() -> Workflow:
+        if oauth_store:
+            from mcp.server.auth.middleware.auth_context import get_access_token
+            access_tok = get_access_token()
+            if access_tok:
+                token_data = oauth_store.get_token_data(access_tok.token)
+                if token_data:
+                    uid, uname = token_data.subject.split(":", 1) if ":" in token_data.subject else ("", token_data.subject)
+                    ident = Identity(user_id=uid, username=uname, role="PRE")
+
+                    async def on_refresh(new_acc: str, new_ref: str | None = None) -> None:
+                        oauth_store.update_django_tokens(access_tok.token, new_acc, new_ref)
+
+                    user_client = MarketIntelClient(
+                        workflow.settings,
+                        access_token=token_data.django_access_token,
+                        refresh_token=token_data.django_refresh_token,
+                        identity=ident,
+                        on_token_refreshed=on_refresh,
+                    )
+                    return Workflow(user_client, shared_store, workflow.settings)
+        return workflow
+
+    mcp = create_mcp(get_active_workflow, auth_settings=auth_settings, auth_server_provider=oauth_provider)
+
+    if enable_oauth and oauth_store:
+        from login_views import create_login_handler
+        mcp.custom_route("/login", methods=["GET", "POST"])(create_login_handler(oauth_store, workflow.settings))
+
     auth_token = args.auth_token or workflow.settings.auth_token
-    mcp = create_mcp(lambda: workflow)
 
     if args.transport == "stdio":
         mcp.run(transport="stdio")
     elif args.transport == "sse":
         import uvicorn
         app = mcp.sse_app(host=args.host)
-        if auth_token:
+        if enable_oauth:
+            print(f"OAuth 2.0 Sign In ACTIVE at {issuer_url} (login route: {issuer_url}/login)", file=sys.stderr)
+        elif auth_token:
             app.add_middleware(TokenAuthMiddleware, secret_token=auth_token)
             print(f"Token protection ACTIVE (use ?token={auth_token[:4]}***).", file=sys.stderr)
         else:
-            print("WARNING: Running without token protection! Set MCP_AUTH_TOKEN in .env to secure.", file=sys.stderr)
+            print("WARNING: Running without authentication! Set MCP_AUTH_TOKEN or MCP_OAUTH_ENABLED in .env to secure.", file=sys.stderr)
         print(f"Starting MCP SSE server on http://{args.host}:{args.port}/sse", file=sys.stderr)
         uvicorn.run(app, host=args.host, port=args.port, log_level=workflow.settings.log_level.lower())
     elif args.transport == "streamable-http":
         import uvicorn
         app = mcp.streamable_http_app(host=args.host)
-        if auth_token:
+        if enable_oauth:
+            print(f"OAuth 2.0 Sign In ACTIVE at {issuer_url} (login route: {issuer_url}/login)", file=sys.stderr)
+        elif auth_token:
             app.add_middleware(TokenAuthMiddleware, secret_token=auth_token)
             print(f"Token protection ACTIVE (use ?token={auth_token[:4]}***).", file=sys.stderr)
         else:
-            print("WARNING: Running without token protection! Set MCP_AUTH_TOKEN in .env to secure.", file=sys.stderr)
+            print("WARNING: Running without authentication! Set MCP_AUTH_TOKEN or MCP_OAUTH_ENABLED in .env to secure.", file=sys.stderr)
         print(f"Starting MCP Streamable-HTTP server on http://{args.host}:{args.port}/mcp", file=sys.stderr)
         uvicorn.run(app, host=args.host, port=args.port, log_level=workflow.settings.log_level.lower())
 

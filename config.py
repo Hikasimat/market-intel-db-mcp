@@ -26,6 +26,9 @@ class Settings:
     log_level: str = "INFO"
     max_parent_lookup_pages: int = 10
     auth_token: str | None = None
+    oauth_enabled: bool = False
+    oauth_issuer_url: str | None = None
+    oauth_db_path: Path | None = None
 
     def __repr__(self) -> str:  # keep secrets out of any accidental log line
         return f"Settings(api_base_url={self.api_base_url!r}, username={self.username!r}, password='***')"
@@ -63,6 +66,13 @@ def load_settings(env_file: Path | None = None) -> Settings:
     if parsed.scheme == "http" and parsed.hostname not in LOCAL_HOSTS:
         raise ConfigError("Use HTTPS for non-local hosts (plain http is allowed for localhost only).")
 
+    oauth_issuer = os.environ.get("MCP_OAUTH_ISSUER_URL", os.environ.get("MCP_ISSUER_URL", "")).strip().rstrip("/") or None
+    raw_oauth = os.environ.get("MCP_OAUTH_ENABLED", "").strip().lower()
+    oauth_enabled = raw_oauth in ("1", "true", "yes") or bool(oauth_issuer)
+
+    db_path_str = os.environ.get("MCP_OAUTH_DB_PATH", "").strip()
+    oauth_db_path = Path(db_path_str).resolve() if db_path_str else (SERVER_DIR / "oauth.db")
+
     return Settings(
         api_base_url=base,
         username=os.environ["MARKET_INTEL_USERNAME"].strip(),
@@ -71,4 +81,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         request_timeout_seconds=_number("MCP_REQUEST_TIMEOUT_SECONDS", "30", float, 1),
         log_level=os.environ.get("MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO",
         auth_token=os.environ.get("MCP_AUTH_TOKEN", "").strip() or None,
+        oauth_enabled=oauth_enabled,
+        oauth_issuer_url=oauth_issuer,
+        oauth_db_path=oauth_db_path,
     )

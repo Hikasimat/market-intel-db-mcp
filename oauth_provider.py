@@ -1,0 +1,189 @@
+"""OAuth 2.0 authorization server provider implementation for FastMCP."""
+from __future__ import annotations
+
+import logging
+import secrets
+import time
+from typing import Any
+
+from pydantic import AnyUrl
+
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    OAuthClientInformationFull,
+    OAuthToken,
+    RefreshToken,
+    TokenError,
+)
+from oauth_store import OAuthStore
+
+log = logging.getLogger("prospect_mcp.oauth")
+
+
+class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
+    def __init__(self, store: OAuthStore, issuer_url: str):
+        self.store = store
+        self.issuer_url = issuer_url.rstrip("/")
+
+    # -------------------------------------------------------- Client Management
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self.store.get_client(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        log.info("Registering OAuth client: %s (%s)", client_info.client_id, client_info.client_name)
+        self.store.save_client(client_info)
+
+    # ------------------------------------------------------------ Authorization
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        session_id = secrets.token_urlsafe(32)
+        redirect_uri_str = str(params.redirect_uri) if params.redirect_uri else ""
+        self.store.save_auth_session(
+            session_id=session_id,
+            client_id=client.client_id,
+            redirect_uri=redirect_uri_str,
+            state=params.state,
+            code_challenge=params.code_challenge,
+            scopes=params.scopes or [],
+            resource=params.resource,
+            ttl_seconds=600,
+        )
+        return f"{self.issuer_url}/login?session_id={session_id}"
+
+    # ------------------------------------------------------- Authorization Code
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        code_data = self.store.get_auth_code(authorization_code)
+        if not code_data:
+            return None
+        if code_data.used:
+            log.warning("Attempted reuse of authorization code %s", authorization_code[:8])
+            return None
+        if code_data.expires_at < time.time():
+            log.warning("Expired authorization code %s", authorization_code[:8])
+            return None
+
+        return AuthorizationCode(
+            code=code_data.code,
+            scopes=code_data.scopes,
+            expires_at=code_data.expires_at,
+            client_id=code_data.client_id,
+            code_challenge=code_data.code_challenge,
+            redirect_uri=AnyUrl(code_data.redirect_uri),
+            redirect_uri_provided_explicitly=True,
+            subject=code_data.subject,
+        )
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        code_data = self.store.get_auth_code(authorization_code.code)
+        if not code_data or code_data.used:
+            raise TokenError("invalid_grant", "Authorization code invalid or already used.")
+
+        self.store.mark_auth_code_used(authorization_code.code)
+
+        access_token = f"mcp_at_{secrets.token_urlsafe(32)}"
+        refresh_token = f"mcp_rt_{secrets.token_urlsafe(32)}"
+        token_ttl = 30 * 86400  # 30 days
+
+        self.store.save_tokens(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            subject=authorization_code.subject or "",
+            resource=authorization_code.resource,
+            django_access_token=code_data.django_access_token,
+            django_refresh_token=code_data.django_refresh_token,
+            access_token_ttl=token_ttl,
+        )
+
+        return OAuthToken(
+            access_token=access_token,
+            token_type="Bearer",
+            expires_in=token_ttl,
+            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+            refresh_token=refresh_token,
+        )
+
+    # ------------------------------------------------------------ Refresh Token
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        token_data = self.store.get_refresh_token_data(refresh_token)
+        if not token_data:
+            return None
+        if token_data.expires_at and token_data.expires_at < time.time():
+            return None
+
+        return RefreshToken(
+            token=token_data.token,
+            client_id=token_data.client_id,
+            scopes=token_data.scopes,
+            expires_at=int(token_data.expires_at) if token_data.expires_at else None,
+            resource=token_data.resource,
+            subject=token_data.subject,
+        )
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        old_data = self.store.get_refresh_token_data(refresh_token.token)
+        if not old_data:
+            raise TokenError("invalid_grant", "Refresh token not found.")
+
+        # Revoke old refresh token & access token
+        self.store.revoke_token(refresh_token.token)
+
+        new_access_token = f"mcp_at_{secrets.token_urlsafe(32)}"
+        new_refresh_token = f"mcp_rt_{secrets.token_urlsafe(32)}"
+        token_ttl = 30 * 86400
+
+        self.store.save_tokens(
+            access_token=new_access_token,
+            refresh_token=new_refresh_token,
+            client_id=client.client_id,
+            scopes=scopes or refresh_token.scopes,
+            subject=refresh_token.subject or "",
+            resource=refresh_token.resource,
+            django_access_token=old_data.django_access_token,
+            django_refresh_token=old_data.django_refresh_token,
+            access_token_ttl=token_ttl,
+        )
+
+        return OAuthToken(
+            access_token=new_access_token,
+            token_type="Bearer",
+            expires_in=token_ttl,
+            scope=" ".join(scopes) if scopes else None,
+            refresh_token=new_refresh_token,
+        )
+
+    # ------------------------------------------------------------- Access Token
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        token_data = self.store.get_token_data(token)
+        if not token_data:
+            return None
+        if token_data.expires_at and token_data.expires_at < time.time():
+            return None
+
+        return AccessToken(
+            token=token_data.token,
+            client_id=token_data.client_id,
+            scopes=token_data.scopes,
+            expires_at=int(token_data.expires_at) if token_data.expires_at else None,
+            resource=token_data.resource,
+            subject=token_data.subject,
+        )
+
+    # --------------------------------------------------------------- Revocation
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        token_str = getattr(token, "token", str(token))
+        self.store.revoke_token(token_str)

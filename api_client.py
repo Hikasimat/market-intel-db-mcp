@@ -98,7 +98,15 @@ class EmailResult:
 
 
 class MarketIntelClient:
-    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+        access_token: str | None = None,
+        refresh_token: str | None = None,
+        identity: Identity | None = None,
+        on_token_refreshed: Any = None,
+    ):
         self._s = settings
         # One pooled client + cookie jar so the cookie-based refresh flow works.
         self._http = httpx.AsyncClient(
@@ -107,9 +115,12 @@ class MarketIntelClient:
             transport=transport,
             headers={"Accept": "application/json"},
         )
-        self._token: str | None = None
+        self._token: str | None = access_token
+        self._refresh_token: str | None = refresh_token
+        self._on_token_refreshed = on_token_refreshed
+        self._token_only: bool = bool(access_token and not settings.username)
         self._auth_lock = asyncio.Lock()
-        self.identity: Identity | None = None
+        self.identity: Identity | None = identity
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -192,14 +203,23 @@ class MarketIntelClient:
     async def _reauthenticate(self) -> None:
         self._token = None
         try:
-            data = await self._send("POST", "/auth/refresh/", auth=False, body={})
+            body = {"refresh": self._refresh_token} if self._refresh_token else {}
+            data = await self._send("POST", "/auth/refresh/", auth=False, body=body)
             token = self._extract_token(data)
             if token:
                 self._token = token
+                if self._on_token_refreshed:
+                    new_ref = data.get("refresh") if isinstance(data, dict) else None
+                    res = self._on_token_refreshed(token, new_ref)
+                    if asyncio.iscoroutine(res):
+                        await res
                 return
         except ApiError:
             pass
-        await self._login()
+        if not self._token_only and self._s.username and self._s.password:
+            await self._login()
+        else:
+            raise AuthError("Session expired and could not be refreshed. Please sign in again.")
 
     async def authenticate(self) -> Identity:
         """Log in and confirm the account is a PRE user. Raises AuthError otherwise."""
