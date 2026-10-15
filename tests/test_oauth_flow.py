@@ -59,6 +59,33 @@ async def test_oauth_store_client_lifecycle(tmp_store):
 
 
 @pytest.mark.asyncio
+async def test_oauth_provider_cimd_resolution(provider, tmp_store):
+    metadata_url = "https://claude.ai/oauth/metadata.json"
+    with respx.mock:
+        respx.get(metadata_url).respond(
+            200,
+            json={
+                "client_name": "Claude",
+                "redirect_uris": ["https://claude.ai/api/connectors/oauth/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+        client = await provider.get_client(metadata_url)
+        assert client is not None
+        assert client.client_id == metadata_url
+        assert client.client_name == "Claude"
+        assert str(client.redirect_uris[0]) == "https://claude.ai/api/connectors/oauth/callback"
+
+        # Should now be cached in store
+        cached = tmp_store.get_client(metadata_url)
+        assert cached is not None
+        assert cached.client_name == "Claude"
+
+
+
+@pytest.mark.asyncio
 async def test_oauth_provider_authorize_and_exchange(provider, tmp_store):
     client = OAuthClientInformationFull(
         client_id="client-abc",

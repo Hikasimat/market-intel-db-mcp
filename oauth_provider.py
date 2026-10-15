@@ -30,7 +30,33 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
 
     # -------------------------------------------------------- Client Management
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self.store.get_client(client_id)
+        client = self.store.get_client(client_id)
+        if client:
+            return client
+
+        # Support CIMD (Client ID Metadata Document - Claude's published identity)
+        if client_id.startswith("https://") or client_id.startswith("http://"):
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10.0) as http_client:
+                    resp = await http_client.get(client_id, headers={"Accept": "application/json"})
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        redirect_uris = [AnyUrl(u) for u in data.get("redirect_uris", [])]
+                        client_info = OAuthClientInformationFull(
+                            client_id=client_id,
+                            client_name=data.get("client_name", "Claude"),
+                            redirect_uris=redirect_uris,
+                            grant_types=data.get("grant_types", ["authorization_code", "refresh_token"]),
+                            token_endpoint_auth_method=data.get("token_endpoint_auth_method", "none"),
+                            scope=data.get("scope"),
+                        )
+                        self.store.save_client(client_info)
+                        return client_info
+            except Exception as e:
+                log.warning("Failed to fetch CIMD client from %s: %s", client_id, e)
+
+        return None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         log.info("Registering OAuth client: %s (%s)", client_info.client_id, client_info.client_name)
