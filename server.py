@@ -17,22 +17,33 @@ from config import ConfigError, load_settings
 from confirmation_store import ConfirmationStore
 from workflow import Workflow
 
-INSTRUCTIONS = """Restricted prospect-entry assistant for Market Intel DB.
-It can only (1) search prospects, (2) validate a NEW prospect, (3) create one confirmed prospect.
-Updating and deleting prospects is NOT possible. Never invent field values, emails, IDs or phone numbers:
-ask the user for anything missing. Workflow: search -> validate -> show summary -> get explicit user approval -> create."""
+INSTRUCTIONS = """Restricted Market Intel MCP server supporting three data modules:
+1. Government Entities
+2. Market Events
+3. Prospects
+
+Mandatory operating rules for Claude:
+1. Inspect the blueprint before researching a new prospect (call get_prospect_blueprint).
+2. Research every applicable blueprint field systematically, not just company name and website.
+3. Never invent facts, IDs, lookups, phone numbers, emails, or verification results.
+4. Always search existing records before attempting to create Government Entities or Market Events.
+5. Missing prerequisite lookup records (Government Entities, Market Events, Parent Companies) must be created and verified before creating the prospect.
+6. Every write must be validated and explicitly approved by the user (show full preview/diff and confirmation token).
+7. Edits require a before-and-after review and explicit user approval.
+8. Delete operations are strictly PROHIBITED for all three modules.
+9. Research sources and unresolved fields must be disclosed to the user.
+10. No record may be reported as created or updated without verified API confirmation."""
 
 PROSPECT_FIELDS_HELP = """
-Required: company_name, country_head_office, complete_address, primary_industries,
-ownership_sector (Private Company | Government Company | Semi Government Company),
-company_structure (Parent | Branch | Subsidiary), operational_status (Active | Inactive |
-Permanently Closed | Acquired | Merged), primary_offering_type (Products | Services | Solutions | Multiple).
-Optional: official_phone_number, official_email_address, official_website_url, linkedin_company_page,
-parent_companies (list of existing prospect UUIDs; required for Branch/Subsidiary - find them with
-search_existing_prospects), merging_companies, dissolved_companies, acquiring_companies_data
-([{company_id, acquisition_date?}]), offerings_data ([{offering_type: Product|Service|Solution, name}]),
-key_contacts ([{prefix?, contact_name, designation, official_email?, phone_number?, linkedin_profile?}]),
-shareholdings. Unsupported fields are rejected."""
+Blueprint Sections:
+1. Corporate Structure & Parent Auto-Linking: company_structure (Parent|Branch|Subsidiary), operational_status (Active|Inactive|Permanently Closed|Acquired|Merged), ownership_sector (Private Company|Government Company|Semi Government Company), parent_companies (list of UUIDs; required for Branch/Subsidiary), merging_companies, dissolved_companies, acquiring_companies_data.
+2. General Information: company_name, country_head_office, complete_address, primary_industries, official_phone_number, official_email_address (must be VALID), official_website_url, linkedin_company_page.
+3. Shareholding / Ownership: shareholdings ([{holder_type: Company|Individual|Government|Other, share_percentage, company?, is_self?, contact?, contact_index?, government_entity?, other_name?}]).
+4. Market Offerings: primary_offering_type (Products|Services|Solutions|Multiple), offerings_data ([{offering_type: Product|Service|Solution, name}]).
+5. Market Events: market_event_ids (list of real Market Event UUIDs).
+6. Key Contacts: key_contacts ([{prefix?, contact_name, designation?, official_email?, phone_number?, linkedin_profile?}]).
+7. Government Entity association: Required for Government/Semi-Government companies via shareholdings with holder_type='Government' and government_entity=<UUID>.
+Unsupported fields are rejected."""
 
 
 def create_mcp(
@@ -53,22 +64,88 @@ def create_mcp(
             return await wf
         return wf
 
+    # --- Blueprint Discovery ---
+    @mcp.tool()
+    async def get_prospect_blueprint() -> dict[str, Any]:
+        """READ-ONLY. Retrieve the complete, authoritative Market Intel Prospect blueprint.
+        Call this tool BEFORE researching a company to obtain the exact fields, required/optional status,
+        allowed choices, numeric limits, conditional rules, lookup dependencies, and validation rules across all
+        7 business sections (Corporate Structure, General Info, Shareholding, Offerings, Events, Contacts, Gov Entity)."""
+        wf = await _resolve_wf()
+        return wf.get_prospect_blueprint()
+
+    # --- Search Tools ---
     @mcp.tool()
     async def search_existing_prospects(query: str, country: str | None = None, limit: int = 10) -> dict[str, Any]:
         """READ-ONLY. Search existing prospects by company name/phrase (optional country filter, limit max 25).
-        Use it to spot possible duplicates and to find parent-company IDs. Returns minimal fields only.
-        Results are limited to what this PRE account can see, so 'no match' does NOT prove the company is new;
-        the backend performs the final global duplicate check at creation. Does not create anything."""
+        Use it to spot possible duplicates and find real parent-company IDs for hierarchy linking.
+        Results are limited to what this account can see; backend duplicate checks decide at creation."""
         wf = await _resolve_wf()
         return await wf.search(query, country, limit)
 
+    @mcp.tool()
+    async def search_government_entities(
+        query: str, country: str | None = None, is_state_government: bool | None = None, limit: int = 10
+    ) -> dict[str, Any]:
+        """READ-ONLY. Search existing government entities by name or country.
+        Use it to verify if a government entity already exists before creating a new one or linking to prospects."""
+        wf = await _resolve_wf()
+        return await wf.search_government_entities(query, country, is_state_government, limit)
+
+    @mcp.tool()
+    async def search_market_events(
+        query: str, host_country: str | None = None, limit: int = 10
+    ) -> dict[str, Any]:
+        """READ-ONLY. Search existing market events (conferences, expos, trade summits) by event title or country.
+        Use it to find real event IDs for linking to prospects via market_event_ids."""
+        wf = await _resolve_wf()
+        return await wf.search_market_events(query, host_country, limit)
+
+    @mcp.tool()
+    async def get_record_details(entity_type: str, record_id: str) -> dict[str, Any]:
+        """READ-ONLY. Retrieve complete details of a specific record by module and UUID.
+        Supported entity_types: 'prospect', 'government_entity', 'market_event'."""
+        wf = await _resolve_wf()
+        return await wf.get_record_details(entity_type, record_id)
+
+    # --- Government Entity Staged Creation ---
+    @mcp.tool(description=(
+        "Validate a NEW Government Entity without creating it. Required fields: name, country. "
+        "Optional: is_state_government, state_name, central_government, official_website, official_email, "
+        "phone_number, complete_address. Checks duplicates. On success returns summary and a confirmation_token."))
+    async def validate_government_entity(entity: dict[str, Any]) -> dict[str, Any]:
+        wf = await _resolve_wf()
+        return await wf.validate_government_entity(entity)
+
+    @mcp.tool()
+    async def create_confirmed_government_entity(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
+        """Create exactly ONE Government Entity from a previously validated payload.
+        Call ONLY after explicit user approval. Returns the created record and its database UUID."""
+        wf = await _resolve_wf()
+        return await wf.create_government_entity(confirmation_token, user_has_explicitly_confirmed)
+
+    # --- Market Event Staged Creation ---
+    @mcp.tool(description=(
+        "Validate a NEW Market Event without creating it. Required fields: event_title, host_country. "
+        "Optional: start_date, end_date, website_url. Checks duplicates. On success returns summary and a confirmation_token."))
+    async def validate_market_event(event: dict[str, Any]) -> dict[str, Any]:
+        wf = await _resolve_wf()
+        return await wf.validate_market_event(event)
+
+    @mcp.tool()
+    async def create_confirmed_market_event(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
+        """Create exactly ONE Market Event from a previously validated payload.
+        Call ONLY after explicit user approval. Returns the created record and its database UUID."""
+        wf = await _resolve_wf()
+        return await wf.create_market_event(confirmation_token, user_has_explicitly_confirmed)
+
+    # --- Prospect Staged Creation ---
     @mcp.tool(description=(
         "Validate a NEW prospect WITHOUT creating it. Checks required fields, enums, formats, parent companies, "
-        "duplicates, offerings, key contacts, and verifies EVERY supplied company/contact email via the existing "
-        "email-verification API (each must be VALID; INVALID/UNKNOWN/errors block creation). Missing required "
-        "fields must be requested from the user - never invent values. On success returns a readable summary and a "
-        "one-time confirmation_token; show the summary to the user and ask for explicit approval before calling "
-        "create_confirmed_prospect. Updating/deleting prospects is not available." + PROSPECT_FIELDS_HELP))
+        "referenced Government Entities, Market Events, duplicates, offerings, key contacts, and verifies EVERY "
+        "supplied company/contact email via the email-verification API (each must be VALID). "
+        "Missing required fields must be requested from the user - never invent values. On success returns a readable "
+        "summary and a one-time confirmation_token; show summary to the user and obtain explicit approval." + PROSPECT_FIELDS_HELP))
     async def validate_prospect_data(prospect: dict[str, Any]) -> dict[str, Any]:
         wf = await _resolve_wf()
         return await wf.validate(prospect)
@@ -81,6 +158,33 @@ def create_mcp(
         and duplicates re-checked first. On a timeout the outcome is UNCERTAIN: do NOT retry; search first."""
         wf = await _resolve_wf()
         return await wf.create(confirmation_token, user_has_explicitly_confirmed)
+
+    # --- Generic & Edit Workflows ---
+    @mcp.tool(description=(
+        "Validate changes to an existing record ('prospect', 'government_entity', or 'market_event'). "
+        "Retrieves current record, merges changes, validates against full blueprint, checks duplicates and emails, "
+        "and returns a before-and-after diff with a confirmation_token. Unspecified fields are preserved. "
+        "Does NOT write to the database."))
+    async def validate_record_update(entity_type: str, record_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        wf = await _resolve_wf()
+        return await wf.validate_record_update(entity_type, record_id, changes)
+
+    @mcp.tool()
+    async def update_confirmed_record(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
+        """Apply an approved update to an existing record. Call ONLY after the user has seen the before-and-after diff "
+        "and explicitly confirmed approval. Verifies the record has not been concurrently modified before applying update."""
+        wf = await _resolve_wf()
+        return await wf.update_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
+
+    @mcp.tool(description="Generic validation dispatcher for any of the three modules ('prospect', 'government_entity', 'market_event').")
+    async def validate_record_creation(entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
+        wf = await _resolve_wf()
+        return await wf.validate_record_creation(entity_type, data)
+
+    @mcp.tool(description="Generic commitment dispatcher for any confirmed creation or update token.")
+    async def create_confirmed_record(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
+        wf = await _resolve_wf()
+        return await wf.create_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
 
     return mcp
 

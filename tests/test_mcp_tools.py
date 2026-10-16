@@ -4,7 +4,23 @@ from config import ConfigError, load_settings
 from server import create_mcp
 from conftest import valid_prospect
 
-EXPECTED = {"search_existing_prospects", "validate_prospect_data", "create_confirmed_prospect"}
+EXPECTED = {
+    "get_prospect_blueprint",
+    "search_existing_prospects",
+    "search_government_entities",
+    "search_market_events",
+    "get_record_details",
+    "validate_prospect_data",
+    "create_confirmed_prospect",
+    "validate_government_entity",
+    "create_confirmed_government_entity",
+    "validate_market_event",
+    "create_confirmed_market_event",
+    "validate_record_creation",
+    "create_confirmed_record",
+    "validate_record_update",
+    "update_confirmed_record",
+}
 
 
 @pytest.fixture
@@ -12,12 +28,12 @@ def mcp(wf):
     return create_mcp(lambda: wf)
 
 
-async def test_exactly_three_tools_registered(mcp):
+async def test_tools_registered_and_forbidden_actions_absent(mcp):
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
     assert names == EXPECTED
-    forbidden = ("delete", "remove", "update", "edit", "modify", "bulk", "import", "request", "http", "shell")
-    assert not [n for n in names if any(f in n for f in forbidden)]
+    forbidden = ("delete", "remove", "destroy", "drop", "bulk", "batch", "import", "request", "http", "shell", "exec")
+    assert not [n for n in names if any(f in n.lower() for f in forbidden)]
 
 
 async def test_create_tool_schema_takes_no_prospect_payload(mcp):

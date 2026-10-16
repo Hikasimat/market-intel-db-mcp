@@ -26,19 +26,45 @@ from config import Settings
 
 log = logging.getLogger("prospect_mcp.api")
 
-ALLOWED_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({
+import re
+
+UUID_PATH_RE = re.compile(
+    r"^/(prospects|government-entities|market-events)/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/$"
+)
+
+ALLOWED_STATIC_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/prospects/"),
     ("POST", "/prospects/"),
+    ("GET", "/government-entities/"),
+    ("POST", "/government-entities/"),
+    ("GET", "/market-events/"),
+    ("POST", "/market-events/"),
     ("POST", "/auth/login/"),
     ("POST", "/auth/refresh/"),
     ("GET", "/auth/me/"),
     ("POST", "/email-verifications/instant-verify/"),
     ("POST", "/email-verifications/verify/"),
 })
-# Read-only / side-effect-free requests that may be retried once after a network failure.
-RETRY_SAFE: frozenset[tuple[str, str]] = frozenset({
-    ("GET", "/prospects/"), ("GET", "/auth/me/"), ("POST", "/email-verifications/instant-verify/"),
-})
+
+ALLOWED_ENDPOINTS = ALLOWED_STATIC_ENDPOINTS
+
+
+def is_endpoint_allowed(method: str, path: str) -> bool:
+    if method == "DELETE":
+        return False
+    if (method, path) in ALLOWED_STATIC_ENDPOINTS:
+        return True
+    if method in ("GET", "PATCH") and UUID_PATH_RE.match(path):
+        return True
+    return False
+
+
+def is_retry_safe(method: str, path: str) -> bool:
+    if method == "GET":
+        return True
+    if (method, path) == ("POST", "/email-verifications/instant-verify/"):
+        return True
+    return False
 MAX_RESPONSE_BYTES = 2_000_000
 ERROR_TEXT_LIMIT = 1000
 TOKEN_KEYS = ("access", "access_token", "token")
@@ -127,12 +153,12 @@ class MarketIntelClient:
 
     # ------------------------------------------------------------ low level
     async def _send(self, method: str, path: str, *, params=None, body=None, auth=True) -> Any:
-        if (method, path) not in ALLOWED_ENDPOINTS:
+        if not is_endpoint_allowed(method, path):
             raise EndpointNotAllowed(f"{method} {path} is not permitted by this MCP server.")
         if auth and not self._token:
             await self._login()
-        # Network retries only for side-effect-free requests; never for creation.
-        network_retries = 1 if (method, path) in RETRY_SAFE else 0
+        # Network retries only for side-effect-free requests; never for creation or updates.
+        network_retries = 1 if is_retry_safe(method, path) else 0
         reauthed = False
         while True:
             headers = {"Authorization": f"Bearer {self._token}"} if auth and self._token else {}
@@ -241,9 +267,89 @@ class MarketIntelClient:
         return self.identity
 
     # ------------------------------------------------------- allowed actions
-    async def list_prospects(self, params: dict[str, Any]) -> Any:
+    # Prospects
+    async def list_prospects(self, params: dict[str, Any] | None = None) -> Any:
         return await self._send("GET", "/prospects/", params=params)
 
+    async def get_prospect(self, prospect_id: str) -> Any:
+        return await self._send("GET", f"/prospects/{prospect_id}/")
+
+    async def create_prospect(self, payload: dict[str, Any]) -> Any:
+        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
+        return await self._send("POST", "/prospects/", body=payload)
+
+    async def update_prospect(self, prospect_id: str, payload: dict[str, Any]) -> Any:
+        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
+        return await self._send("PATCH", f"/prospects/{prospect_id}/", body=payload)
+
+    # Government Entities
+    async def list_government_entities(self, params: dict[str, Any] | None = None) -> Any:
+        return await self._send("GET", "/government-entities/", params=params)
+
+    async def get_government_entity(self, entity_id: str) -> Any:
+        return await self._send("GET", f"/government-entities/{entity_id}/")
+
+    async def create_government_entity(self, payload: dict[str, Any]) -> Any:
+        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
+        return await self._send("POST", "/government-entities/", body=payload)
+
+    async def update_government_entity(self, entity_id: str, payload: dict[str, Any]) -> Any:
+        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
+        return await self._send("PATCH", f"/government-entities/{entity_id}/", body=payload)
+
+    # Market Events
+    async def list_market_events(self, params: dict[str, Any] | None = None) -> Any:
+        return await self._send("GET", "/market-events/", params=params)
+
+    async def get_market_event(self, event_id: str) -> Any:
+        return await self._send("GET", f"/market-events/{event_id}/")
+
+    async def create_market_event(self, payload: dict[str, Any]) -> Any:
+        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
+        return await self._send("POST", "/market-events/", body=payload)
+
+    async def update_market_event(self, event_id: str, payload: dict[str, Any]) -> Any:
+        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
+        return await self._send("PATCH", f"/market-events/{event_id}/", body=payload)
+
+    # Generic record helpers
+    async def get_record(self, module: str, record_id: str) -> Any:
+        endpoint_map = {
+            "prospect": f"/prospects/{record_id}/",
+            "prospects": f"/prospects/{record_id}/",
+            "government_entity": f"/government-entities/{record_id}/",
+            "government_entities": f"/government-entities/{record_id}/",
+            "government-entity": f"/government-entities/{record_id}/",
+            "government-entities": f"/government-entities/{record_id}/",
+            "market_event": f"/market-events/{record_id}/",
+            "market_events": f"/market-events/{record_id}/",
+            "market-event": f"/market-events/{record_id}/",
+            "market-events": f"/market-events/{record_id}/",
+        }
+        path = endpoint_map.get(module.lower())
+        if not path:
+            raise EndpointNotAllowed(f"Unsupported module: {module}")
+        return await self._send("GET", path)
+
+    async def update_record(self, module: str, record_id: str, payload: dict[str, Any]) -> Any:
+        endpoint_map = {
+            "prospect": f"/prospects/{record_id}/",
+            "prospects": f"/prospects/{record_id}/",
+            "government_entity": f"/government-entities/{record_id}/",
+            "government_entities": f"/government-entities/{record_id}/",
+            "government-entity": f"/government-entities/{record_id}/",
+            "government-entities": f"/government-entities/{record_id}/",
+            "market_event": f"/market-events/{record_id}/",
+            "market_events": f"/market-events/{record_id}/",
+            "market-event": f"/market-events/{record_id}/",
+            "market-events": f"/market-events/{record_id}/",
+        }
+        path = endpoint_map.get(module.lower())
+        if not path:
+            raise EndpointNotAllowed(f"Unsupported module: {module}")
+        return await self._send("PATCH", path, body=payload)
+
+    # Verification
     async def instant_verify(self, email: str) -> EmailResult:
         """Never raises: any failure becomes a non-VALID result."""
         try:
@@ -263,10 +369,6 @@ class MarketIntelClient:
             return EmailResult(email, "ERROR", "Unexpected or missing verification status in response.")
         reason = data.get("reason") or data.get("message") or ""
         return EmailResult(email, status, str(reason)[:300])
-
-    async def create_prospect(self, payload: dict[str, Any]) -> Any:
-        """Single attempt, no retry. Timeouts surface as ApiTimeout (uncertain)."""
-        return await self._send("POST", "/prospects/", body=payload)
 
     async def persist_verification(self, prospect_id: str, email: str, contact_id: str | None = None) -> Any:
         body: dict[str, Any] = {"prospect_id": prospect_id, "email_address": email}

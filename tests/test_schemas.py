@@ -135,10 +135,73 @@ def test_individual_shareholder_index_out_of_range():
     assert "contact_index" in errs(valid_prospect(shareholdings=sh))[1]
 
 
-def test_government_shareholder_and_market_events_rejected_as_unverifiable():
-    sh = [{"holder_type": "Government", "government_entity": str(uuid.uuid4()), "share_percentage": 10}]
-    assert "cannot be verified" in errs(valid_prospect(shareholdings=sh))[1]
-    assert "market_event_ids" in errs(valid_prospect(market_event_ids=["1"]))[1]
+def test_government_shareholder_and_market_events_accepted_when_valid():
+    gov_id = str(uuid.uuid4())
+    event_id = str(uuid.uuid4())
+    sh = [{"holder_type": "Government", "government_entity": gov_id, "share_percentage": 10}]
+    p, e = parse_prospect(valid_prospect(shareholdings=sh, market_event_ids=[event_id]))
+    assert e == []
+    assert p.market_event_ids == [uuid.UUID(event_id)]
+    assert business_rule_errors(p) == []
+
+
+def test_government_sector_requires_government_shareholder():
+    p, _ = parse_prospect(valid_prospect(ownership_sector="Government Company"))
+    errs_list = business_rule_errors(p)
+    assert any("Government Company" in err and "government entity" in err.lower() for err in errs_list)
+
+
+def test_invalid_market_event_ids_rejected():
+    p, e = parse_prospect(valid_prospect(market_event_ids=["not-a-uuid"]))
+    assert p is None and any("market_event_ids" in err for err in e)
+
+
+def test_government_entity_schema_validation():
+    from schemas import parse_government_entity
+    valid = {"name": "Ministry of Energy", "country": "India", "is_state_government": False}
+    g, errs = parse_government_entity(valid)
+    assert errs == [] and g.name == "Ministry of Energy"
+
+    # Extra fields rejected
+    bad = {**valid, "unsupported_field": "bad"}
+    g_bad, errs_bad = parse_government_entity(bad)
+    assert g_bad is None and any("not a supported field" in e for e in errs_bad)
+
+    # Missing required name
+    bad2 = {"country": "India"}
+    g_bad2, errs_bad2 = parse_government_entity(bad2)
+    assert g_bad2 is None and any("name" in e for e in errs_bad2)
+
+
+def test_market_event_schema_validation():
+    from schemas import parse_market_event
+    valid = {
+        "event_title": "Energy Summit 2026",
+        "host_country": "India",
+        "start_date": "2026-10-01",
+        "end_date": "2026-10-03",
+        "website_url": "https://energysummit.example.com",
+    }
+    m, errs = parse_market_event(valid)
+    assert errs == [] and m.event_title == "Energy Summit 2026"
+
+    # End date before start date rejected
+    bad_dates = {**valid, "start_date": "2026-10-05", "end_date": "2026-10-02"}
+    m_bad, errs_bad = parse_market_event(bad_dates)
+    assert m_bad is None and any("end_date cannot be earlier than start_date" in e for e in errs_bad)
+
+
+def test_prospect_blueprint_structure():
+    from schemas import PROSPECT_BLUEPRINT
+    sections = PROSPECT_BLUEPRINT["sections"]
+    section_names = {s["title"] for s in sections}
+    assert "Corporate Structure & Parent Auto-Linking" in section_names
+    assert "General Information" in section_names
+    assert "Shareholding / Ownership" in section_names
+    assert "Market Offerings" in section_names
+    assert "Market Events" in section_names
+    assert "Key Contacts / Personnel" in section_names
+    assert "Government Entity Association" in section_names
 
 
 def test_acquired_and_merged_rules():

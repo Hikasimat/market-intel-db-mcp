@@ -36,6 +36,16 @@ def referenced_company_ids(p: ProspectInput) -> set[str]:
     return ids
 
 
+def referenced_government_entity_ids(p: ProspectInput) -> set[str]:
+    """Every Government Entity UUID referenced in shareholdings."""
+    return {str(s.government_entity) for s in p.shareholdings if s.holder_type == "Government" and s.government_entity}
+
+
+def referenced_market_event_ids(p: ProspectInput) -> set[str]:
+    """Every Market Event UUID referenced in market_event_ids."""
+    return {str(u) for u in p.market_event_ids}
+
+
 def business_rule_errors(p: ProspectInput) -> list[str]:
     errs: list[str] = []
 
@@ -89,15 +99,23 @@ def business_rule_errors(p: ProspectInput) -> list[str]:
         total += s.share_percentage
         if s.holder_type == "Individual" and s.contact_index is not None and s.contact_index >= len(p.key_contacts):
             errs.append(f"shareholdings[{i}]: contact_index {s.contact_index} does not match any key contact in this payload.")
-        if s.holder_type == "Government":
-            errs.append(f"shareholdings[{i}]: government entity references cannot be verified through the permitted "
-                        "read APIs, so this shareholding was rejected rather than guessed.")
+        if s.holder_type == "Government" and not s.government_entity:
+            errs.append(f"shareholdings[{i}]: government_entity UUID is required when holder_type is 'Government'.")
     if total > 100.0001:
         errs.append(f"shareholdings: total share percentage is {total:g}, which exceeds 100.")
 
-    if p.market_event_ids:
-        errs.append("market_event_ids: market events cannot be verified through the permitted read APIs, "
-                    "so they were rejected rather than guessed. Remove the field.")
+    # Government entity association requirement for government ownership sectors
+    if p.ownership_sector in ("Government Company", "Semi Government Company"):
+        has_gov = any(s.holder_type == "Government" and s.government_entity for s in p.shareholdings)
+        if not has_gov:
+            errs.append(
+                f"ownership_sector is '{p.ownership_sector}', which requires at least one Government Entity "
+                "shareholder association (Government Entity Name * in shareholdings)."
+            )
+
+    # Market events duplicate ID check
+    errs += _duplicates("market_event_ids", [str(u) for u in p.market_event_ids])
+
     return errs
 
 
@@ -120,3 +138,84 @@ def find_duplicates(company_name: str, records: list[dict[str, Any]]) -> tuple[l
         elif target in name or name in target or SequenceMatcher(None, target, name).ratio() >= SIMILARITY_THRESHOLD:
             similar.append(r)
     return exact, similar
+
+
+def find_government_entity_duplicates(name: str, country: str, records: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
+    """Find exact (name + country) and similar government entities."""
+    t_name = " ".join(name.split()).casefold()
+    t_country = " ".join(country.split()).casefold()
+    exact, similar = [], []
+    for r in records:
+        r_name = " ".join(str(r.get("name", "")).split()).casefold()
+        r_country = " ".join(str(r.get("country", "")).split()).casefold()
+        if not r_name:
+            continue
+        if r_name == t_name and r_country == t_country:
+            exact.append(r)
+        elif t_name in r_name or r_name in t_name or SequenceMatcher(None, t_name, r_name).ratio() >= SIMILARITY_THRESHOLD:
+            similar.append(r)
+    return exact, similar
+
+
+def find_market_event_duplicates(title: str, records: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
+    """Find exact and similar market events by event_title."""
+    t_title = " ".join(title.split()).casefold()
+    exact, similar = [], []
+    for r in records:
+        r_title = " ".join(str(r.get("event_title", "")).split()).casefold()
+        if not r_title:
+            continue
+        if r_title == t_title:
+            exact.append(r)
+        elif t_title in r_title or r_title in t_title or SequenceMatcher(None, t_title, r_title).ratio() >= SIMILARITY_THRESHOLD:
+            similar.append(r)
+    return exact, similar
+
+
+PROSPECT_EDITABLE_FIELDS = frozenset({
+    "company_name", "country_head_office", "complete_address",
+    "official_phone_number", "official_email_address", "official_website_url",
+    "linkedin_company_page", "primary_industries", "company_structure",
+    "operational_status", "ownership_sector", "primary_offering_type",
+    "parent_companies", "merging_companies", "dissolved_companies",
+    "acquiring_companies_data", "offerings_data", "key_contacts",
+    "shareholdings", "market_event_ids",
+})
+
+GOVERNMENT_ENTITY_EDITABLE_FIELDS = frozenset({
+    "name", "country", "is_state_government", "state_name", "central_government",
+    "official_website", "official_email", "phone_number", "complete_address",
+})
+
+MARKET_EVENT_EDITABLE_FIELDS = frozenset({
+    "event_title", "host_country", "start_date", "end_date", "website_url",
+})
+
+EDITABLE_FIELDS_BY_MODULE = {
+    "prospect": PROSPECT_EDITABLE_FIELDS,
+    "prospects": PROSPECT_EDITABLE_FIELDS,
+    "government_entity": GOVERNMENT_ENTITY_EDITABLE_FIELDS,
+    "government_entities": GOVERNMENT_ENTITY_EDITABLE_FIELDS,
+    "government-entity": GOVERNMENT_ENTITY_EDITABLE_FIELDS,
+    "government-entities": GOVERNMENT_ENTITY_EDITABLE_FIELDS,
+    "market_event": MARKET_EVENT_EDITABLE_FIELDS,
+    "market_events": MARKET_EVENT_EDITABLE_FIELDS,
+    "market-event": MARKET_EVENT_EDITABLE_FIELDS,
+    "market-events": MARKET_EVENT_EDITABLE_FIELDS,
+}
+
+
+def compute_record_diff(
+    original: dict[str, Any],
+    updated: dict[str, Any],
+    allowed_fields: frozenset[str],
+) -> dict[str, dict[str, Any]]:
+    """Returns {field: {"before": old, "after": new, "old": old, "new": new}} for modified fields only."""
+    diff = {}
+    for field in allowed_fields:
+        if field in updated:
+            old_val = original.get(field)
+            new_val = updated.get(field)
+            if old_val != new_val:
+                diff[field] = {"before": old_val, "after": new_val, "old": old_val, "new": new_val}
+    return diff

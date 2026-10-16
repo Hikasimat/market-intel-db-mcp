@@ -24,9 +24,12 @@ def mock_auth(role="PRE", me_status=200):
 
 def test_allowlist_is_exactly_the_approved_set():
     assert ALLOWED_ENDPOINTS == {
-        ("GET", "/prospects/"), ("POST", "/auth/login/"), ("POST", "/auth/refresh/"), ("GET", "/auth/me/"),
-        ("POST", "/email-verifications/instant-verify/"), ("POST", "/prospects/"),
-        ("POST", "/email-verifications/verify/")}
+        ("POST", "/auth/login/"), ("POST", "/auth/refresh/"), ("GET", "/auth/me/"),
+        ("POST", "/email-verifications/instant-verify/"), ("POST", "/email-verifications/verify/"),
+        ("GET", "/prospects/"), ("POST", "/prospects/"),
+        ("GET", "/government-entities/"), ("POST", "/government-entities/"),
+        ("GET", "/market-events/"), ("POST", "/market-events/"),
+    }
     assert not {m for m, _ in ALLOWED_ENDPOINTS} & {"PUT", "PATCH", "DELETE"}
 
 
@@ -34,6 +37,10 @@ def test_allowlist_is_exactly_the_approved_set():
 @pytest.mark.parametrize("method,path", [
     ("DELETE", "/prospects/"), ("PATCH", "/prospects/"), ("PUT", "/prospects/"),
     ("DELETE", "/prospects/123/"), ("GET", "/prospects/123/"), ("GET", "/users/"),
+    ("DELETE", "/prospects/11111111-1111-1111-1111-111111111111/"),
+    ("DELETE", "/government-entities/11111111-1111-1111-1111-111111111111/"),
+    ("DELETE", "/market-events/11111111-1111-1111-1111-111111111111/"),
+    ("PUT", "/prospects/11111111-1111-1111-1111-111111111111/"),
     ("POST", "/prospects/../users/"), ("GET", "https://evil.example/x"), ("POST", "/auth/me/"),
     ("GET", "/email-verifications/verify/"),
 ])
@@ -47,8 +54,12 @@ async def test_rejects_arbitrary_endpoints_and_methods(settings, method, path):
 
 def test_no_public_method_exposes_raw_requests():
     public = [n for n, _ in inspect.getmembers(MarketIntelClient, inspect.isfunction) if not n.startswith("_")]
-    assert set(public) == {"aclose", "authenticate", "list_prospects", "instant_verify",
-                           "create_prospect", "persist_verification"}
+    assert set(public) == {
+        "aclose", "authenticate", "list_prospects", "get_prospect", "create_prospect", "update_prospect",
+        "list_government_entities", "get_government_entity", "create_government_entity", "update_government_entity",
+        "list_market_events", "get_market_event", "create_market_event", "update_market_event",
+        "get_record", "update_record", "instant_verify", "persist_verification"
+    }
 
 
 @respx.mock
