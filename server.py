@@ -15,7 +15,7 @@ from mcp.server.mcpserver import MCPServer  # mcp 2.x (renamed from FastMCP in 1
 from api_client import AuthError, ApiError, Identity, MarketIntelClient
 from config import ConfigError, load_settings
 from confirmation_store import ConfirmationStore
-from whatsapp_workflow import SlidingWindowRateLimiter, StagedMediaStore, WhatsAppWorkflow
+from whatsapp_workflow import EphemeralQRStore, SlidingWindowRateLimiter, StagedMediaStore, WhatsAppWorkflow
 from workflow import Workflow
 
 INSTRUCTIONS = """Restricted Market Intel MCP server supporting four data/integration modules:
@@ -226,7 +226,8 @@ def create_mcp(
     # --- WhatsApp Connection Tools ---
     @mcp.tool(description=(
         "Initiate or resume the authenticated Market Intel user's WhatsApp session. "
-        "Returns connection status and phone number when connected, or QR code data when scanning is required. "
+        "Returns connection status and phone number when connected, or a scannable QR link (`qr_url`) / QR data "
+        "when scanning is required. When `qr_url` is returned, give that clickable link directly to the user so they can scan it. "
         "Set wait_for_connection=true (and optional timeout_seconds, max 60) to poll until connected."
     ))
     async def connect_whatsapp(
@@ -257,7 +258,8 @@ def create_mcp(
 
     @mcp.tool(description=(
         "Retrieve the live WhatsApp QR code for the authenticated user's session if authentication is needed, "
-        "or report connected status if already authenticated. Set force_restart=true to regenerate the QR code."
+        "or report connected status if already authenticated. When `qr_url` is returned, give that clickable link "
+        "directly to the user instead of raw base64 image data. Set force_restart=true to regenerate the QR code."
     ))
     async def get_whatsapp_qr_code(force_restart: bool = False) -> dict[str, Any]:
         wa = await _resolve_wa_wf()
@@ -495,6 +497,12 @@ class TokenAuthMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
+            path = scope.get("path", "")
+            method = scope.get("method", "GET")
+            if method in ("GET", "HEAD") and path.startswith("/whatsapp/qr/"):
+                await self.app(scope, receive, send)
+                return
+
             from urllib.parse import parse_qs
             from starlette.responses import JSONResponse
 
@@ -692,12 +700,20 @@ def main() -> None:
     shared_store = ConfirmationStore(workflow.settings.confirmation_ttl_seconds)
     shared_rate_limiter = SlidingWindowRateLimiter(workflow.settings.whatsapp_rate_limit_per_minute)
     shared_media_store = StagedMediaStore(workflow.settings.confirmation_ttl_seconds)
+    shared_qr_store = EphemeralQRStore()
+    qr_public_base_url = (
+        issuer_url.strip().rstrip("/")
+        if (args.transport in ("sse", "streamable-http") and issuer_url)
+        else None
+    )
     default_wa_workflow = WhatsAppWorkflow(
         workflow.client,
         shared_store,
         workflow.settings,
         rate_limiter=shared_rate_limiter,
         media_store=shared_media_store,
+        qr_store=shared_qr_store,
+        qr_public_base_url=qr_public_base_url,
     )
 
     def _build_oauth_client() -> MarketIntelClient | None:
@@ -744,6 +760,8 @@ def main() -> None:
                 workflow.settings,
                 rate_limiter=shared_rate_limiter,
                 media_store=shared_media_store,
+                qr_store=shared_qr_store,
+                qr_public_base_url=qr_public_base_url,
             )
             setattr(wa, "_ephemeral_client", True)
             return wa
@@ -759,6 +777,11 @@ def main() -> None:
     if enable_oauth and oauth_store:
         from login_views import create_login_handler
         mcp.custom_route("/login", methods=["GET", "POST"])(create_login_handler(oauth_store, workflow.settings))
+
+    if args.transport in ("sse", "streamable-http"):
+        from whatsapp_qr_views import create_qr_image_handler, create_qr_page_handler
+        mcp.custom_route("/whatsapp/qr/{token}", methods=["GET"])(create_qr_page_handler(shared_qr_store))
+        mcp.custom_route("/whatsapp/qr/{token}/image", methods=["GET"])(create_qr_image_handler(shared_qr_store))
 
     auth_token = args.auth_token or workflow.settings.auth_token
 

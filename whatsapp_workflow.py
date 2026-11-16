@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
+import secrets
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
@@ -137,6 +141,130 @@ class StagedMediaStore:
             return content
 
 
+ALLOWED_QR_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+MAX_QR_IMAGE_BYTES = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class QRRecord:
+    """In-memory ephemeral QR image bound to a single Market Intel user."""
+    user_key: str
+    username: str
+    session_name: str
+    image_bytes: bytes
+    mime_type: str
+    created_at: float
+    expires_at: float
+
+
+def parse_qr_image_data(qr_base64: str = "", qr_raw: str = "") -> tuple[bytes, str] | None:
+    """Decode a base64 or data-URI QR image payload into validated raster bytes and MIME type."""
+    candidate = (qr_base64 or "").strip()
+    if not candidate and qr_raw and str(qr_raw).strip().startswith("data:image/"):
+        candidate = str(qr_raw).strip()
+    if not candidate:
+        return None
+
+    mime_type = "image/png"
+    b64_part = candidate
+    if candidate.startswith("data:"):
+        if "," not in candidate:
+            return None
+        header, b64_part = candidate.split(",", 1)
+        if ";base64" not in header.lower():
+            return None
+        raw_mime = header[5:].split(";", 1)[0].strip().lower()
+        if raw_mime == "image/jpg":
+            raw_mime = "image/jpeg"
+        if raw_mime not in ALLOWED_QR_IMAGE_MIMES:
+            return None
+        mime_type = raw_mime
+
+    compact = "".join(b64_part.split())
+    if not compact:
+        return None
+    if len(compact) > ((MAX_QR_IMAGE_BYTES * 4) // 3) + 16:
+        return None
+    try:
+        img_bytes = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if not img_bytes or len(img_bytes) > MAX_QR_IMAGE_BYTES:
+        return None
+    return img_bytes, mime_type
+
+
+class EphemeralQRStore:
+    """Short-lived, token-addressed in-memory vault for WhatsApp pairing QR images."""
+
+    def __init__(
+        self,
+        ttl_seconds: int = 120,
+        max_items: int = 200,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self._ttl = max(30, int(ttl_seconds))
+        self._max_items = max(1, int(max_items))
+        self._clock = clock
+        self._items: dict[str, QRRecord] = {}
+        self._lock = threading.Lock()
+
+    def now(self) -> float:
+        return self._clock()
+
+    @staticmethod
+    def _slot(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _purge_expired(self, now: float) -> None:
+        self._items = {k: v for k, v in self._items.items() if v.expires_at > now}
+
+    def put(
+        self,
+        user_key: str,
+        username: str,
+        session_name: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+    ) -> tuple[str, int]:
+        now = self._clock()
+        token = secrets.token_urlsafe(32)
+        rec = QRRecord(
+            user_key=user_key,
+            username=username,
+            session_name=session_name,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            created_at=now,
+            expires_at=now + self._ttl,
+        )
+        with self._lock:
+            self._purge_expired(now)
+            while len(self._items) >= self._max_items:
+                oldest_key = min(self._items, key=lambda k: self._items[k].expires_at)
+                self._items.pop(oldest_key, None)
+            self._items[self._slot(token)] = rec
+        return token, self._ttl
+
+    def get(self, token: str) -> QRRecord | None:
+        tok = (token or "").strip()
+        if not (16 <= len(tok) <= 128):
+            return None
+        now = self._clock()
+        with self._lock:
+            self._purge_expired(now)
+            rec = self._items.get(self._slot(tok))
+            if rec is None or rec.expires_at <= now:
+                return None
+            return rec
+
+    def purge_user(self, user_key: str) -> int:
+        with self._lock:
+            before = len(self._items)
+            self._items = {k: v for k, v in self._items.items() if v.user_key != user_key}
+            return before - len(self._items)
+
+
 def _extract_status(status_data: Any) -> str:
     if not isinstance(status_data, dict):
         return "UNKNOWN"
@@ -241,14 +369,50 @@ class WhatsAppWorkflow:
         media_store: StagedMediaStore | None = None,
         sleep_fn: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
+        qr_store: EphemeralQRStore | None = None,
+        qr_public_base_url: str | None = None,
     ):
         self.client = client
         self.store = store
         self.settings = settings
         self.rate_limiter = rate_limiter or SlidingWindowRateLimiter(settings.whatsapp_rate_limit_per_minute, clock)
         self.media_store = media_store or StagedMediaStore(settings.confirmation_ttl_seconds, clock=clock)
+        self.qr_store = qr_store or EphemeralQRStore(clock=clock)
+        raw_base = qr_public_base_url if qr_public_base_url is not None else settings.oauth_issuer_url
+        self.qr_public_base_url = raw_base.strip().rstrip("/") if raw_base else None
         self._sleep = sleep_fn
         self._clock = clock
+
+    def _attach_qr_output(
+        self,
+        out: dict[str, Any],
+        ident: Identity,
+        session_name: str,
+        qr_base64: str,
+        qr_raw: str,
+    ) -> bool:
+        """Attach a short-lived hosted QR link when public URL is available, else fallback to raw QR fields."""
+        if self.qr_public_base_url:
+            parsed = parse_qr_image_data(qr_base64, qr_raw)
+            if parsed is not None:
+                img_bytes, mime_type = parsed
+                token, ttl = self.qr_store.put(
+                    user_key=ident.key,
+                    username=ident.username,
+                    session_name=session_name,
+                    image_bytes=img_bytes,
+                    mime_type=mime_type,
+                )
+                qr_url = f"{self.qr_public_base_url}/whatsapp/qr/{token}"
+                out["qr_url"] = qr_url
+                out["qr_expires_in_seconds"] = ttl
+                out["qr_omitted"] = True
+                return True
+        if qr_base64:
+            out["qr_base64"] = qr_base64
+        if qr_raw and qr_raw != qr_base64:
+            out["qr"] = qr_raw
+        return False
 
     async def _identity(self, *, require_manage: bool = False, refresh_from_api: bool = False) -> Identity:
         allowed = WHATSAPP_MANAGE_ROLES if require_manage else WHATSAPP_READ_ROLES
@@ -439,6 +603,7 @@ class WhatsAppWorkflow:
 
             state = await self._get_verified_session_state(ident, sync_sessions=True)
             if state["connected"] and not params.force_restart:
+                self.qr_store.purge_user(ident.key)
                 return {
                     "ok": True,
                     "connected": True,
@@ -458,6 +623,7 @@ class WhatsAppWorkflow:
             qr_resp = await self.client.get_whatsapp_qr(force_restart=params.force_restart)
             qr_status = _extract_status(qr_resp)
             if _is_connected_status(qr_status, qr_resp):
+                self.qr_store.purge_user(ident.key)
                 synced = await self._get_verified_session_state(ident, sync_sessions=True)
                 phone = synced["phone_number"] or _extract_phone_from_status(qr_resp)
                 return {
@@ -482,6 +648,7 @@ class WhatsAppWorkflow:
                     await self._sleep(min(poll_interval, max(0.05, deadline - self._clock())))
                     polled = await self._get_verified_session_state(ident, sync_sessions=True)
                     if polled["connected"]:
+                        self.qr_store.purge_user(ident.key)
                         return {
                             "ok": True,
                             "connected": True,
@@ -498,6 +665,7 @@ class WhatsAppWorkflow:
                     if isinstance(qr_poll, dict):
                         last_qr = qr_poll
                         if _is_connected_status(_extract_status(qr_poll), qr_poll):
+                            self.qr_store.purge_user(ident.key)
                             synced = await self._get_verified_session_state(ident, sync_sessions=True)
                             phone = synced["phone_number"] or _extract_phone_from_status(qr_poll)
                             return {
@@ -516,6 +684,7 @@ class WhatsAppWorkflow:
             cur_status = _extract_status(last_qr)
             qr_base64 = last_qr.get("qrBase64") or ""
             qr_raw = last_qr.get("qr") or last_qr.get("value") or ""
+            eff_session = last_qr.get("session_name") or state["session_name"]
             resp_out: dict[str, Any] = {
                 "ok": True,
                 "connected": False,
@@ -523,19 +692,24 @@ class WhatsAppWorkflow:
                 "status": cur_status,
                 "user_id": ident.user_id,
                 "username": ident.username,
-                "session_name": last_qr.get("session_name") or state["session_name"],
+                "session_name": eff_session,
             }
             if qr_base64 or qr_raw:
                 resp_out["qr_required"] = True
-                if qr_base64:
-                    resp_out["qr_base64"] = qr_base64
-                if qr_raw and qr_raw != qr_base64:
-                    resp_out["qr"] = qr_raw
-                resp_out["next_step"] = (
-                    "Scan this QR code in WhatsApp (Settings -> Linked Devices -> Link a Device) "
-                    "or on your Market Intel WhatsApp page, then call get_whatsapp_connection_status "
-                    "or connect_whatsapp(wait_for_connection=true)."
-                )
+                hosted = self._attach_qr_output(resp_out, ident, eff_session, qr_base64, qr_raw)
+                if hosted:
+                    resp_out["next_step"] = (
+                        f"Give the user this link to view and scan the QR code (expires in {resp_out['qr_expires_in_seconds']}s): "
+                        f"{resp_out['qr_url']} . Do NOT paste base64 image data into chat. "
+                        "Once the user confirms they scanned it, call get_whatsapp_connection_status "
+                        "or connect_whatsapp(wait_for_connection=true)."
+                    )
+                else:
+                    resp_out["next_step"] = (
+                        "Scan this QR code in WhatsApp (Settings -> Linked Devices -> Link a Device) "
+                        "or on your Market Intel WhatsApp page, then call get_whatsapp_connection_status "
+                        "or connect_whatsapp(wait_for_connection=true)."
+                    )
             else:
                 resp_out["qr_required"] = cur_status in QR_REQUIRED_STATUSES
                 resp_out["next_step"] = (
@@ -556,6 +730,8 @@ class WhatsAppWorkflow:
         try:
             ident = await self._identity(require_manage=False, refresh_from_api=True)
             state = await self._get_verified_session_state(ident, sync_sessions=True)
+            if state["connected"]:
+                self.qr_store.purge_user(ident.key)
             return {
                 "ok": True,
                 "user_id": ident.user_id,
@@ -587,6 +763,7 @@ class WhatsAppWorkflow:
 
             qr_status = _extract_status(qr_data)
             if _is_connected_status(qr_status, qr_data):
+                self.qr_store.purge_user(ident.key)
                 state = await self._get_verified_session_state(ident, sync_sessions=True)
                 phone = state["phone_number"] or _extract_phone_from_status(qr_data)
                 return {
@@ -600,18 +777,24 @@ class WhatsAppWorkflow:
                     "message": "WhatsApp is already connected; no QR code required.",
                 }
 
+            eff_session = qr_data.get("session_name") or ""
             out: dict[str, Any] = {
                 "ok": True,
                 "connected": False,
                 "status": qr_status,
-                "session_name": qr_data.get("session_name") or "",
+                "session_name": eff_session,
                 "user_id": ident.user_id,
                 "username": ident.username,
             }
-            if qr_data.get("qrBase64"):
-                out["qr_base64"] = qr_data["qrBase64"]
-            if qr_data.get("qr") and qr_data.get("qr") != qr_data.get("qrBase64"):
-                out["qr"] = qr_data["qr"]
+            qr_base64 = qr_data.get("qrBase64") or ""
+            qr_raw = qr_data.get("qr") or qr_data.get("value") or ""
+            if qr_base64 or qr_raw:
+                hosted = self._attach_qr_output(out, ident, eff_session, qr_base64, qr_raw)
+                if hosted:
+                    out["next_step"] = (
+                        f"Give the user this link to view and scan the QR code (expires in {out['qr_expires_in_seconds']}s): "
+                        f"{out['qr_url']} . Do NOT paste base64 image data into chat."
+                    )
             if qr_data.get("message"):
                 out["message"] = qr_data["message"]
             return out
@@ -687,6 +870,7 @@ class WhatsAppWorkflow:
         session_name = op.payload.get("session_name") or None
         try:
             res = await self.client.logout_whatsapp_session(session_name)
+            self.qr_store.purge_user(ident.key)
             self.store.mark(op, "UPDATED")
             return {
                 "disconnected": True,

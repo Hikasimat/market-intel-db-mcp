@@ -838,3 +838,111 @@ async def test_http_client_whatsapp_endpoints_and_multipart_media(wa_settings):
     await client.aclose()
 
 
+async def test_hosted_qr_url_and_http_view_handlers():
+    from starlette.requests import Request
+    from server import TokenAuthMiddleware
+    from whatsapp_qr_views import create_qr_image_handler, create_qr_page_handler
+    from whatsapp_workflow import EphemeralQRStore, parse_qr_image_data
+
+    # Unsafe SVG data URI must never be accepted for hosted QR serving
+    assert parse_qr_image_data("data:image/svg+xml;base64,PHN2Zy8+") is None
+
+    now = [1000.0]
+    qr_store = EphemeralQRStore(ttl_seconds=120, clock=lambda: now[0])
+    settings = Settings(
+        api_base_url=BASE,
+        username="pre_alice",
+        password="pw",
+        oauth_enabled=True,
+        oauth_issuer_url="https://mcp.example.com",
+    )
+    c = FakeWhatsAppClient(session_name="sess_<xss>", phone_number=None, status="SCAN_QR_CODE")
+    c.status_sequence = [
+        {"status": "SCAN_QR_CODE", "phone_number": None},
+        {"status": "READY", "phone_number": "+919876500000"},
+    ]
+    wa = WhatsAppWorkflow(
+        c,
+        ConfirmationStore(),
+        settings,
+        clock=lambda: now[0],
+        qr_store=qr_store,
+        qr_public_base_url="https://mcp.example.com",
+    )
+
+    res = await wa.connect_whatsapp(wait_for_connection=False)
+    assert res["ok"] is True
+    assert res["qr_required"] is True
+    assert res["qr_omitted"] is True
+    assert "qr_base64" not in res
+    assert "qr" not in res
+    assert res["qr_expires_in_seconds"] == 120
+    assert res["qr_url"].startswith("https://mcp.example.com/whatsapp/qr/")
+    token = res["qr_url"].rsplit("/", 1)[-1]
+
+    page_handler = create_qr_page_handler(qr_store)
+    img_handler = create_qr_image_handler(qr_store)
+
+    page_req = Request({"type": "http", "method": "GET", "path": f"/whatsapp/qr/{token}", "path_params": {"token": token}, "headers": [], "query_string": b""})
+    page_resp = await page_handler(page_req)
+    assert page_resp.status_code == 200
+    assert page_resp.headers["cache-control"].startswith("no-store")
+    assert page_resp.headers["x-content-type-options"] == "nosniff"
+    body_text = page_resp.body.decode("utf-8")
+    assert f"/whatsapp/qr/{token}/image" in body_text
+    assert "sess_&lt;xss&gt;" in body_text
+    assert "<xss>" not in body_text
+
+    img_req = Request({"type": "http", "method": "GET", "path": f"/whatsapp/qr/{token}/image", "path_params": {"token": token}, "headers": [], "query_string": b""})
+    img_resp = await img_handler(img_req)
+    assert img_resp.status_code == 200
+    assert img_resp.media_type == "image/png"
+    assert img_resp.body == b"fake_qr_image"
+
+    # Also test direct get_whatsapp_qr_code returns qr_url
+    qr_res = await wa.get_whatsapp_qr_code()
+    assert qr_res["ok"] is True
+    assert qr_res["qr_url"].startswith("https://mcp.example.com/whatsapp/qr/")
+    assert "qr_base64" not in qr_res
+    token2 = qr_res["qr_url"].rsplit("/", 1)[-1]
+
+    # Once WhatsApp connects, outstanding QR tokens for that user are purged immediately
+    status_res = await wa.get_whatsapp_connection_status()
+    assert status_res["connected"] is True
+    assert qr_store.get(token) is None
+    assert qr_store.get(token2) is None
+
+    expired_page = await page_handler(page_req)
+    assert expired_page.status_code == 410
+    expired_img = await img_handler(img_req)
+    assert expired_img.status_code == 410
+
+    # Verify TTL expiry cleanup
+    token3, _ = qr_store.put("user-1", "alice", "sess_1", b"pngbytes", "image/png")
+    assert qr_store.get(token3) is not None
+    now[0] += 121.0
+    assert qr_store.get(token3) is None
+
+    # Verify TokenAuthMiddleware allows GET /whatsapp/qr/... without MCP_AUTH_TOKEN, blocks /mcp and POST
+    async def dummy_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    mw = TokenAuthMiddleware(dummy_app, "secret123")
+
+    async def run_mw(method: str, path: str) -> int:
+        status_holder: list[int] = []
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                status_holder.append(msg["status"])
+        async def receive():
+            return {"type": "http.request", "body": b""}
+        await mw({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""}, receive, send)
+        return status_holder[0]
+
+    assert await run_mw("GET", f"/whatsapp/qr/{token}") == 200
+    assert await run_mw("POST", f"/whatsapp/qr/{token}") == 401
+    assert await run_mw("GET", "/mcp") == 401
+
+
+
