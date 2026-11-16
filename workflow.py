@@ -149,6 +149,11 @@ class Workflow:
         if self.client.identity is None:
             await self.client.authenticate()
         assert self.client.identity is not None
+        if str(self.client.identity.role or "").strip().upper() != "PRE":
+            raise AuthError(
+                f"Account role is {self.client.identity.role or 'unknown'!r}; "
+                "only PRE accounts are permitted for Prospect, Government Entity, and Market Event operations."
+            )
         return self.client.identity
 
     # ------------------------------------------------------------- blueprint

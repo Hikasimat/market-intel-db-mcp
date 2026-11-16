@@ -29,6 +29,11 @@ def test_allowlist_is_exactly_the_approved_set():
         ("GET", "/prospects/"), ("POST", "/prospects/"),
         ("GET", "/government-entities/"), ("POST", "/government-entities/"),
         ("GET", "/market-events/"), ("POST", "/market-events/"),
+        ("GET", "/whatsapp/status/"), ("GET", "/whatsapp/session/list/"),
+        ("POST", "/whatsapp/session/start/"), ("POST", "/whatsapp/session/logout/"),
+        ("GET", "/whatsapp/qr/"), ("GET", "/whatsapp/conversations/"),
+        ("GET", "/whatsapp/crm-contacts/"),
+        ("POST", "/whatsapp/send/"), ("POST", "/whatsapp/send-media/"),
     }
     assert not {m for m, _ in ALLOWED_ENDPOINTS} & {"PUT", "PATCH", "DELETE"}
 
@@ -43,6 +48,12 @@ def test_allowlist_is_exactly_the_approved_set():
     ("PUT", "/prospects/11111111-1111-1111-1111-111111111111/"),
     ("POST", "/prospects/../users/"), ("GET", "https://evil.example/x"), ("POST", "/auth/me/"),
     ("GET", "/email-verifications/verify/"),
+    ("POST", "/whatsapp/webhook/"),
+    ("DELETE", "/whatsapp/conversations/11111111-1111-1111-1111-111111111111/"),
+    ("DELETE", "/whatsapp/messages/11111111-1111-1111-1111-111111111111/"),
+    ("GET", "/whatsapp/contact-info/../users/"),
+    ("GET", "/whatsapp/conversations/not-a-uuid/messages/"),
+    ("POST", "/whatsapp/config/"),
 ])
 async def test_rejects_arbitrary_endpoints_and_methods(settings, method, path):
     c = mk(settings)
@@ -55,10 +66,16 @@ async def test_rejects_arbitrary_endpoints_and_methods(settings, method, path):
 def test_no_public_method_exposes_raw_requests():
     public = [n for n, _ in inspect.getmembers(MarketIntelClient, inspect.isfunction) if not n.startswith("_")]
     assert set(public) == {
-        "aclose", "authenticate", "list_prospects", "get_prospect", "create_prospect", "update_prospect",
+        "aclose", "authenticate", "authenticate_whatsapp",
+        "list_prospects", "get_prospect", "create_prospect", "update_prospect",
         "list_government_entities", "get_government_entity", "create_government_entity", "update_government_entity",
         "list_market_events", "get_market_event", "create_market_event", "update_market_event",
-        "get_record", "update_record", "instant_verify", "persist_verification"
+        "get_record", "update_record", "instant_verify", "persist_verification",
+        "get_whatsapp_status", "list_whatsapp_sessions", "start_whatsapp_session",
+        "logout_whatsapp_session", "get_whatsapp_qr", "list_whatsapp_conversations",
+        "get_whatsapp_conversation_messages", "mark_whatsapp_conversation_read",
+        "get_whatsapp_contact_info", "list_whatsapp_crm_contacts",
+        "send_whatsapp_message", "send_whatsapp_media",
     }
 
 

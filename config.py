@@ -16,6 +16,9 @@ class ConfigError(Exception):
     """Raised when required settings are missing or unsafe."""
 
 
+VALID_WHATSAPP_ROLES = frozenset({"PRE", "LQ", "MANAGER", "SUPERUSER"})
+
+
 @dataclass(frozen=True)
 class Settings:
     api_base_url: str
@@ -29,6 +32,11 @@ class Settings:
     oauth_enabled: bool = False
     oauth_issuer_url: str | None = None
     oauth_db_path: Path | None = None
+    whatsapp_allowed_roles: tuple[str, ...] = ("PRE",)
+    whatsapp_rate_limit_per_minute: int = 30
+    whatsapp_max_media_mb: int = 25
+    whatsapp_connect_poll_interval: float = 1.5
+    whatsapp_max_search_conversations: int = 25
 
     def __repr__(self) -> str:  # keep secrets out of any accidental log line
         return f"Settings(api_base_url={self.api_base_url!r}, username={self.username!r}, password='***')"
@@ -73,6 +81,21 @@ def load_settings(env_file: Path | None = None) -> Settings:
     db_path_str = os.environ.get("MCP_OAUTH_DB_PATH", "").strip()
     oauth_db_path = Path(db_path_str).resolve() if db_path_str else (SERVER_DIR / "oauth.db")
 
+    raw_wa_roles = os.environ.get("MCP_WHATSAPP_ALLOWED_ROLES", "PRE").strip()
+    if raw_wa_roles:
+        wa_roles = tuple(r.strip().upper() for r in raw_wa_roles.split(",") if r.strip())
+    else:
+        wa_roles = ("PRE",)
+    invalid_roles = [r for r in wa_roles if r not in VALID_WHATSAPP_ROLES]
+    if invalid_roles:
+        raise ConfigError(
+            "Invalid role(s) in MCP_WHATSAPP_ALLOWED_ROLES: " + ", ".join(invalid_roles)
+        )
+
+    max_media_mb = _number("MCP_WHATSAPP_MAX_MEDIA_MB", "25", int, 1)
+    if max_media_mb > 25:
+        raise ConfigError("MCP_WHATSAPP_MAX_MEDIA_MB must be <= 25.")
+
     return Settings(
         api_base_url=base,
         username=os.environ["MARKET_INTEL_USERNAME"].strip(),
@@ -84,4 +107,9 @@ def load_settings(env_file: Path | None = None) -> Settings:
         oauth_enabled=oauth_enabled,
         oauth_issuer_url=oauth_issuer,
         oauth_db_path=oauth_db_path,
+        whatsapp_allowed_roles=wa_roles or ("PRE",),
+        whatsapp_rate_limit_per_minute=_number("MCP_WHATSAPP_RATE_LIMIT_PER_MINUTE", "30", int, 1),
+        whatsapp_max_media_mb=max_media_mb,
+        whatsapp_connect_poll_interval=_number("MCP_WHATSAPP_CONNECT_POLL_INTERVAL", "1.5", float, 0.1),
+        whatsapp_max_search_conversations=_number("MCP_WHATSAPP_MAX_SEARCH_CONVERSATIONS", "25", int, 1),
     )

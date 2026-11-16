@@ -15,12 +15,14 @@ from mcp.server.mcpserver import MCPServer  # mcp 2.x (renamed from FastMCP in 1
 from api_client import AuthError, ApiError, Identity, MarketIntelClient
 from config import ConfigError, load_settings
 from confirmation_store import ConfirmationStore
+from whatsapp_workflow import SlidingWindowRateLimiter, StagedMediaStore, WhatsAppWorkflow
 from workflow import Workflow
 
-INSTRUCTIONS = """Restricted Market Intel MCP server supporting three data modules:
+INSTRUCTIONS = """Restricted Market Intel MCP server supporting four data/integration modules:
 1. Government Entities
 2. Market Events
 3. Prospects
+4. WhatsApp Messaging & Session Integration
 
 Mandatory operating rules for Claude:
 1. Inspect the blueprint before researching a new prospect (call get_prospect_blueprint).
@@ -30,9 +32,11 @@ Mandatory operating rules for Claude:
 5. Missing prerequisite lookup records (Government Entities, Market Events, Parent Companies) must be created and verified before creating the prospect.
 6. Every write must be validated and explicitly approved by the user (show full preview/diff and confirmation token).
 7. Edits require a before-and-after review and explicit user approval.
-8. Delete operations are strictly PROHIBITED for all three modules.
+8. Delete operations are strictly PROHIBITED for all modules.
 9. Research sources and unresolved fields must be disclosed to the user.
-10. No record may be reported as created or updated without verified API confirmation."""
+10. No record or WhatsApp message may be reported as created, updated, or sent without verified API confirmation.
+11. WhatsApp operations are strictly scoped to the authenticated Market Intel user's own connected session and conversations.
+12. Outbound WhatsApp messages, media sends, and session disconnects require explicit user approval via confirmation_token and user_has_explicitly_confirmed=true."""
 
 PROSPECT_FIELDS_HELP = """
 Blueprint Sections:
@@ -50,6 +54,7 @@ def create_mcp(
     get_workflow: Callable[[], Workflow | Awaitable[Workflow]],
     auth_settings: Any = None,
     auth_server_provider: Any = None,
+    get_whatsapp_workflow: Callable[[], WhatsAppWorkflow | Awaitable[WhatsAppWorkflow]] | None = None,
 ) -> MCPServer:
     mcp = MCPServer(
         "market-intel-prospect-entry",
@@ -58,11 +63,43 @@ def create_mcp(
         auth_server_provider=auth_server_provider,
     )
 
+    fallback_rate_limiter: SlidingWindowRateLimiter | None = None
+    fallback_media_store: StagedMediaStore | None = None
+
     async def _resolve_wf() -> Workflow:
         wf = get_workflow()
         if asyncio.iscoroutine(wf):
             return await wf
         return wf
+
+    async def _resolve_wa_wf() -> WhatsAppWorkflow:
+        nonlocal fallback_rate_limiter, fallback_media_store
+        if get_whatsapp_workflow is not None:
+            wa = get_whatsapp_workflow()
+            if asyncio.iscoroutine(wa):
+                return await wa
+            return wa
+        wf = await _resolve_wf()
+        if fallback_rate_limiter is None:
+            fallback_rate_limiter = SlidingWindowRateLimiter(wf.settings.whatsapp_rate_limit_per_minute)
+        if fallback_media_store is None:
+            fallback_media_store = StagedMediaStore(wf.settings.confirmation_ttl_seconds)
+        wa = WhatsAppWorkflow(
+            wf.client,
+            wf.store,
+            wf.settings,
+            rate_limiter=fallback_rate_limiter,
+            media_store=fallback_media_store,
+        )
+        setattr(wa, "_ephemeral_client", getattr(wf, "_ephemeral_client", False))
+        return wa
+
+    async def _close_if_ephemeral(holder: Any) -> None:
+        if getattr(holder, "_ephemeral_client", False) and hasattr(holder.client, "aclose"):
+            try:
+                await holder.client.aclose()
+            except Exception:
+                pass
 
     # --- Blueprint Discovery ---
     @mcp.tool()
@@ -185,6 +222,240 @@ def create_mcp(
     async def create_confirmed_record(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
         wf = await _resolve_wf()
         return await wf.create_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
+
+    # --- WhatsApp Connection Tools ---
+    @mcp.tool(description=(
+        "Initiate or resume the authenticated Market Intel user's WhatsApp session. "
+        "Returns connection status and phone number when connected, or QR code data when scanning is required. "
+        "Set wait_for_connection=true (and optional timeout_seconds, max 60) to poll until connected."
+    ))
+    async def connect_whatsapp(
+        wait_for_connection: bool = False,
+        timeout_seconds: int = 30,
+        force_restart: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.connect_whatsapp(
+                wait_for_connection=wait_for_connection,
+                timeout_seconds=timeout_seconds,
+                force_restart=force_restart,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "READ-ONLY. Check the authenticated user's WhatsApp session connection status, "
+        "bound WhatsApp phone number, identity verification state, and outbound safety configuration."
+    ))
+    async def get_whatsapp_connection_status() -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.get_whatsapp_connection_status()
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Retrieve the live WhatsApp QR code for the authenticated user's session if authentication is needed, "
+        "or report connected status if already authenticated. Set force_restart=true to regenerate the QR code."
+    ))
+    async def get_whatsapp_qr_code(force_restart: bool = False) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.get_whatsapp_qr_code(force_restart=force_restart)
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Disconnect (logout) the authenticated user's WhatsApp session while preserving all persisted "
+        "conversations and message history in Market Intel DB. Requires explicit user confirmation via "
+        "confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def disconnect_whatsapp(
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.disconnect_whatsapp(
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    # --- WhatsApp Conversation Tools ---
+    @mcp.tool(description=(
+        "READ-ONLY. List WhatsApp chats owned by the authenticated user's connected session. "
+        "Supports optional search filter, is_group filter, matched_only filter, configurable limit (1-100), and cursor pagination."
+    ))
+    async def list_whatsapp_chats(
+        search: str | None = None,
+        is_group: bool | None = None,
+        matched_only: bool = False,
+        limit: int = 25,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.list_whatsapp_chats(
+                search=search,
+                is_group=is_group,
+                matched_only=matched_only,
+                limit=limit,
+                cursor=cursor,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "READ-ONLY. Retrieve persisted conversation message history from Market Intel DB for one of the "
+        "authenticated user's owned chats (by conversation_id, chat_id, or phone_number). "
+        "Includes direction, timestamps, delivery/read status, media metadata, reply_context, and cursor pagination."
+    ))
+    async def get_whatsapp_chat_history(
+        conversation_id: str | None = None,
+        chat_id: str | None = None,
+        phone_number: str | None = None,
+        page_size: int = 50,
+        cursor: str | None = None,
+        order: str = "asc",
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.get_whatsapp_chat_history(
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                phone_number=phone_number,
+                page_size=page_size,
+                cursor=cursor,
+                order=order,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "READ-ONLY. Retrieve contact details, CRM Prospect/Key Person linkage, and group members "
+        "for an owned WhatsApp chat (by chat_id, phone_number, or conversation_id)."
+    ))
+    async def get_whatsapp_contact_details(
+        chat_id: str | None = None,
+        phone_number: str | None = None,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.get_whatsapp_contact_details(
+                chat_id=chat_id,
+                phone_number=phone_number,
+                conversation_id=conversation_id,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "READ-ONLY. Search persisted WhatsApp messages strictly within the authenticated user's owned conversations. "
+        "Supports optional conversation_id/chat_id scope, direction ('INBOUND'/'OUTBOUND'), has_media filter, limit, and cursor."
+    ))
+    async def search_whatsapp_messages(
+        query: str,
+        conversation_id: str | None = None,
+        chat_id: str | None = None,
+        direction: str | None = None,
+        has_media: bool | None = None,
+        limit: int = 25,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.search_whatsapp_messages(
+                query=query,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                direction=direction,
+                has_media=has_media,
+                limit=limit,
+                cursor=cursor,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    # --- WhatsApp Messaging Tools ---
+    @mcp.tool(description=(
+        "Send a WhatsApp text message through the authenticated user's connected Market Intel session. "
+        "Call first without confirmation_token to validate the recipient/session and obtain a preview + confirmation_token; "
+        "after explicit user approval, call again with confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def send_whatsapp_message(
+        recipient: str | None = None,
+        message_body: str = "",
+        chat_id: str | None = None,
+        prospect_contact_id: str | None = None,
+        reply_to: str | None = None,
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.send_whatsapp_message(
+                recipient=recipient,
+                message_body=message_body,
+                chat_id=chat_id,
+                prospect_contact_id=prospect_contact_id,
+                reply_to=reply_to,
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Send a media attachment (image, document, audio, video as base64) via the authenticated user's connected WhatsApp session. "
+        "Call first with file details to validate and obtain a preview + confirmation_token; "
+        "after explicit user approval, call again with confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def send_whatsapp_media(
+        recipient: str | None = None,
+        chat_id: str | None = None,
+        filename: str = "",
+        mime_type: str = "",
+        file_base64: str = "",
+        caption: str = "",
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.send_whatsapp_media(
+                recipient=recipient,
+                chat_id=chat_id,
+                filename=filename,
+                mime_type=mime_type,
+                file_base64=file_base64,
+                caption=caption,
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Mark all inbound messages in an owned WhatsApp conversation as read in Market Intel DB and WAHA."
+    ))
+    async def mark_whatsapp_chat_read(
+        conversation_id: str | None = None,
+        chat_id: str | None = None,
+        phone_number: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.mark_whatsapp_chat_read(
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                phone_number=phone_number,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
 
     return mcp
 
@@ -419,8 +690,17 @@ def main() -> None:
         )
 
     shared_store = ConfirmationStore(workflow.settings.confirmation_ttl_seconds)
+    shared_rate_limiter = SlidingWindowRateLimiter(workflow.settings.whatsapp_rate_limit_per_minute)
+    shared_media_store = StagedMediaStore(workflow.settings.confirmation_ttl_seconds)
+    default_wa_workflow = WhatsAppWorkflow(
+        workflow.client,
+        shared_store,
+        workflow.settings,
+        rate_limiter=shared_rate_limiter,
+        media_store=shared_media_store,
+    )
 
-    async def get_active_workflow() -> Workflow:
+    def _build_oauth_client() -> MarketIntelClient | None:
         if oauth_store:
             from mcp.server.auth.middleware.auth_context import get_access_token
             access_tok = get_access_token()
@@ -428,22 +708,53 @@ def main() -> None:
                 token_data = oauth_store.get_token_data(access_tok.token)
                 if token_data:
                     uid, uname = token_data.subject.split(":", 1) if ":" in token_data.subject else ("", token_data.subject)
-                    ident = Identity(user_id=uid, username=uname, role="PRE")
+                    ident = Identity(
+                        user_id=uid,
+                        username=uname,
+                        role=getattr(token_data, "role", "PRE") or "PRE",
+                        is_superuser=bool(getattr(token_data, "is_superuser", False)),
+                    )
 
                     async def on_refresh(new_acc: str, new_ref: str | None = None) -> None:
                         oauth_store.update_django_tokens(access_tok.token, new_acc, new_ref)
 
-                    user_client = MarketIntelClient(
+                    return MarketIntelClient(
                         workflow.settings,
                         access_token=token_data.django_access_token,
                         refresh_token=token_data.django_refresh_token,
                         identity=ident,
                         on_token_refreshed=on_refresh,
                     )
-                    return Workflow(user_client, shared_store, workflow.settings)
+        return None
+
+    async def get_active_workflow() -> Workflow:
+        user_client = _build_oauth_client()
+        if user_client is not None:
+            wf = Workflow(user_client, shared_store, workflow.settings)
+            setattr(wf, "_ephemeral_client", True)
+            return wf
         return workflow
 
-    mcp = create_mcp(get_active_workflow, auth_settings=auth_settings, auth_server_provider=oauth_provider)
+    async def get_active_whatsapp_workflow() -> WhatsAppWorkflow:
+        user_client = _build_oauth_client()
+        if user_client is not None:
+            wa = WhatsAppWorkflow(
+                user_client,
+                shared_store,
+                workflow.settings,
+                rate_limiter=shared_rate_limiter,
+                media_store=shared_media_store,
+            )
+            setattr(wa, "_ephemeral_client", True)
+            return wa
+        return default_wa_workflow
+
+    mcp = create_mcp(
+        get_active_workflow,
+        auth_settings=auth_settings,
+        auth_server_provider=oauth_provider,
+        get_whatsapp_workflow=get_active_whatsapp_workflow,
+    )
 
     if enable_oauth and oauth_store:
         from login_views import create_login_handler

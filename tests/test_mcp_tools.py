@@ -20,6 +20,17 @@ EXPECTED = {
     "create_confirmed_record",
     "validate_record_update",
     "update_confirmed_record",
+    "connect_whatsapp",
+    "get_whatsapp_connection_status",
+    "get_whatsapp_qr_code",
+    "disconnect_whatsapp",
+    "list_whatsapp_chats",
+    "get_whatsapp_chat_history",
+    "get_whatsapp_contact_details",
+    "search_whatsapp_messages",
+    "send_whatsapp_message",
+    "send_whatsapp_media",
+    "mark_whatsapp_chat_read",
 }
 
 

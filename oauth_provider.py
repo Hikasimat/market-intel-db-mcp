@@ -128,6 +128,8 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             django_access_token=code_data.django_access_token,
             django_refresh_token=code_data.django_refresh_token,
             access_token_ttl=token_ttl,
+            role=code_data.role,
+            is_superuser=code_data.is_superuser,
         )
 
         return OAuthToken(
@@ -184,6 +186,8 @@ class SQLiteOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             django_access_token=old_data.django_access_token,
             django_refresh_token=old_data.django_refresh_token,
             access_token_ttl=token_ttl,
+            role=old_data.role,
+            is_superuser=old_data.is_superuser,
         )
 
         return OAuthToken(

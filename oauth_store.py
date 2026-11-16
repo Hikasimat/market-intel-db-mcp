@@ -42,6 +42,8 @@ class StoredAuthCode:
     django_refresh_token: str | None
     expires_at: float
     used: bool
+    role: str = "PRE"
+    is_superuser: bool = False
 
 
 @dataclass
@@ -55,6 +57,8 @@ class StoredTokenData:
     django_refresh_token: str | None
     expires_at: float | None
     refresh_token: str | None = None
+    role: str = "PRE"
+    is_superuser: bool = False
 
 
 class OAuthStore:
@@ -146,6 +150,14 @@ class OAuthStore:
                 conn.execute("ALTER TABLE oauth_clients ADD COLUMN client_secret_expires_at REAL")
             if "client_id_issued_at" not in existing_cols:
                 conn.execute("ALTER TABLE oauth_clients ADD COLUMN client_id_issued_at REAL")
+
+            for table in ("auth_codes", "access_tokens", "refresh_tokens"):
+                cur = conn.execute(f"PRAGMA table_info({table})")
+                cols = {row["name"] for row in cur.fetchall()}
+                if "role" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN role TEXT DEFAULT 'PRE'")
+                if "is_superuser" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN is_superuser INTEGER DEFAULT 0")
 
             # Backfill any existing clients with NULL token_endpoint_auth_method:
             conn.execute("""
@@ -294,6 +306,8 @@ class OAuthStore:
         django_access_token: str,
         django_refresh_token: str | None = None,
         ttl_seconds: int = 300,
+        role: str = "PRE",
+        is_superuser: bool = False,
     ) -> None:
         expires_at = time.time() + ttl_seconds
         with self._get_connection() as conn:
@@ -301,8 +315,9 @@ class OAuthStore:
                 """
                 INSERT OR REPLACE INTO auth_codes (
                     code, client_id, redirect_uri, code_challenge, scopes_json,
-                    subject, django_access_token, django_refresh_token, expires_at, used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    subject, django_access_token, django_refresh_token, expires_at, used,
+                    role, is_superuser
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     code,
@@ -314,6 +329,8 @@ class OAuthStore:
                     django_access_token,
                     django_refresh_token,
                     expires_at,
+                    role,
+                    1 if is_superuser else 0,
                 ),
             )
             conn.commit()
@@ -324,6 +341,7 @@ class OAuthStore:
             row = cur.fetchone()
             if not row:
                 return None
+            keys = row.keys()
             return StoredAuthCode(
                 code=row["code"],
                 client_id=row["client_id"],
@@ -335,6 +353,8 @@ class OAuthStore:
                 django_refresh_token=row["django_refresh_token"],
                 expires_at=float(row["expires_at"]),
                 used=bool(row["used"]),
+                role=(row["role"] if "role" in keys and row["role"] else "PRE"),
+                is_superuser=bool(row["is_superuser"]) if "is_superuser" in keys and row["is_superuser"] is not None else False,
             )
 
     def mark_auth_code_used(self, code: str) -> None:
@@ -355,6 +375,8 @@ class OAuthStore:
         django_refresh_token: str | None,
         access_token_ttl: int = 30 * 86400,  # 30 days
         refresh_token_ttl: int = 90 * 86400,  # 90 days
+        role: str = "PRE",
+        is_superuser: bool = False,
     ) -> None:
         now = time.time()
         access_expires_at = now + access_token_ttl
@@ -365,8 +387,9 @@ class OAuthStore:
                 """
                 INSERT OR REPLACE INTO access_tokens (
                     token, refresh_token, client_id, scopes_json, subject, resource,
-                    django_access_token, django_refresh_token, expires_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    django_access_token, django_refresh_token, expires_at, created_at,
+                    role, is_superuser
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     access_token,
@@ -379,6 +402,8 @@ class OAuthStore:
                     django_refresh_token,
                     access_expires_at,
                     now,
+                    role,
+                    1 if is_superuser else 0,
                 ),
             )
             if refresh_token:
@@ -386,8 +411,9 @@ class OAuthStore:
                     """
                     INSERT OR REPLACE INTO refresh_tokens (
                         token, access_token, client_id, scopes_json, subject, resource,
-                        django_access_token, django_refresh_token, expires_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        django_access_token, django_refresh_token, expires_at, created_at,
+                        role, is_superuser
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         refresh_token,
@@ -400,6 +426,8 @@ class OAuthStore:
                         django_refresh_token,
                         refresh_expires_at,
                         now,
+                        role,
+                        1 if is_superuser else 0,
                     ),
                 )
             conn.commit()
@@ -410,6 +438,7 @@ class OAuthStore:
             row = cur.fetchone()
             if not row:
                 return None
+            keys = row.keys()
             return StoredTokenData(
                 token=row["token"],
                 refresh_token=row["refresh_token"],
@@ -420,6 +449,8 @@ class OAuthStore:
                 django_access_token=row["django_access_token"],
                 django_refresh_token=row["django_refresh_token"],
                 expires_at=float(row["expires_at"]) if row["expires_at"] else None,
+                role=(row["role"] if "role" in keys and row["role"] else "PRE"),
+                is_superuser=bool(row["is_superuser"]) if "is_superuser" in keys and row["is_superuser"] is not None else False,
             )
 
     def get_refresh_token_data(self, refresh_token: str) -> StoredTokenData | None:
@@ -428,6 +459,7 @@ class OAuthStore:
             row = cur.fetchone()
             if not row:
                 return None
+            keys = row.keys()
             return StoredTokenData(
                 token=row["token"],
                 refresh_token=row["token"],
@@ -438,6 +470,8 @@ class OAuthStore:
                 django_access_token=row["django_access_token"],
                 django_refresh_token=row["django_refresh_token"],
                 expires_at=float(row["expires_at"]) if row["expires_at"] else None,
+                role=(row["role"] if "role" in keys and row["role"] else "PRE"),
+                is_superuser=bool(row["is_superuser"]) if "is_superuser" in keys and row["is_superuser"] is not None else False,
             )
 
     def update_django_tokens(

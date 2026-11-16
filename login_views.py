@@ -265,7 +265,7 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                     if not access_token:
                         return render_login(session_id, username, "Login succeeded but no access token was returned.")
 
-                    # 2. Check /auth/me/ to verify PRE role
+                    # 2. Check /auth/me/ to verify authorized role
                     me_resp = await client.get(
                         f"{settings.api_base_url}/auth/me/",
                         headers={"Authorization": f"Bearer {access_token}"},
@@ -279,13 +279,19 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                     if isinstance(role, dict):
                         role = role.get("name") or role.get("code")
                     role = str(role or "").strip().upper()
+                    is_superuser = bool(user.get("is_superuser"))
 
-                    if role != "PRE":
-                        return render_login(
-                            session_id,
-                            username,
-                            f"Account role is '{role or 'Unknown'}'. Only accounts with the PRE role are permitted.",
-                        )
+                    allowed_roles = set(getattr(settings, "whatsapp_allowed_roles", ("PRE",)))
+                    role_permitted = (role in allowed_roles) or (is_superuser and "SUPERUSER" in allowed_roles)
+                    if not role_permitted:
+                        if allowed_roles == {"PRE"}:
+                            err_msg = f"Account role is '{role or 'Unknown'}'. Only accounts with the PRE role are permitted."
+                        else:
+                            err_msg = (
+                                f"Account role is '{role or 'Unknown'}'. "
+                                f"Only accounts with roles {', '.join(sorted(allowed_roles))} are permitted."
+                            )
+                        return render_login(session_id, username, err_msg)
 
                     user_id = str(user.get("id") or user.get("pk") or "")
                     subject = f"{user_id}:{username}"
@@ -306,6 +312,8 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                 django_access_token=access_token,
                 django_refresh_token=refresh_token,
                 ttl_seconds=300,
+                role=role or ("SUPERUSER" if is_superuser else ""),
+                is_superuser=is_superuser,
             )
 
             # Consume the auth session
