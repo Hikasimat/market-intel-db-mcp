@@ -73,13 +73,14 @@ jobs:
       - name: Build and push Docker image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
         shell: bash
         run: |
           set -euo pipefail
 
           IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-          docker build --pull -t "$IMAGE_URI" .
+          docker build --pull --provenance=false -t "$IMAGE_URI" .
           docker push "$IMAGE_URI"
 
           echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
