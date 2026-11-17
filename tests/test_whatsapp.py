@@ -1395,4 +1395,61 @@ async def test_edit_forward_and_group_actions_and_delete_blocked(wa_settings):
     await raw_client.aclose()
 
 
+@respx.mock
+async def test_email_login_canonical_subject_and_incoming_messages_identity_refresh(wa_settings, tmp_path):
+    from oauth_store import OAuthStore
+
+    # 1. OAuth login with email stores canonical Django username in subject
+    store = OAuthStore(str(tmp_path / "oauth_email.db"))
+    store.save_auth_session("sess_email", "cid_1", "http://localhost/cb", "st1", "ch1", ["read"], None)
+    handler = create_login_handler(store, wa_settings)
+
+    respx.post(f"{BASE}/auth/login/").mock(return_value=httpx.Response(200, json={"access": "acc-email"}))
+    respx.get(f"{BASE}/auth/me/").mock(
+        return_value=httpx.Response(200, json={"id": 42, "username": "MohanRaj", "role": "PRE", "is_superuser": False})
+    )
+
+    class _PostReq:
+        method = "POST"
+        query_params = {}
+        async def form(self):
+            return {"session_id": "sess_email", "username": "mohanrajvmvm221023@gmail.com", "password": "pw"}
+
+    login_resp = await handler(_PostReq())
+    assert login_resp.status_code == 302
+    loc = login_resp.headers["location"]
+    code = loc.split("code=")[1].split("&")[0]
+    auth_code = store.get_auth_code(code)
+    assert auth_code is not None
+    assert auth_code.subject == "42:MohanRaj"
+
+    # 2. Stale cached Identity with email in username refreshes dynamically on incoming messages
+    client = MarketIntelClient(
+        wa_settings,
+        access_token="acc-email",
+        identity=Identity("42", "mohanrajvmvm221023@gmail.com", "PRE"),
+    )
+    respx.get(f"{BASE}/whatsapp/status/").mock(return_value=httpx.Response(200, json={
+        "status": "READY",
+        "phone_number": "+919003619221",
+        "session": {"session_name": "wa_u42_abc", "owner_username": "MohanRaj", "status": "READY"},
+    }))
+    respx.get(f"{BASE}/whatsapp/session/list/").mock(return_value=httpx.Response(200, json=[
+        {"id": 1, "session_name": "wa_u42_abc", "status": "READY", "phone_number": "+919003619221", "owner_username": "MohanRaj"}
+    ]))
+    respx.get(f"{BASE}/auth/me/").mock(return_value=httpx.Response(200, json={
+        "id": 42, "username": "MohanRaj", "role": "PRE", "is_superuser": False,
+        "whatsapp_sessions": [{"id": 1, "session_name": "wa_u42_abc", "status": "READY", "phone_number": "+919003619221"}],
+    }))
+    respx.post(f"{BASE}/whatsapp/sync-history/").mock(return_value=httpx.Response(200, json={"synced": 0}))
+    respx.get(f"{BASE}/whatsapp/conversations/").mock(return_value=httpx.Response(200, json=[]))
+
+    wa = _make_wa(client, wa_settings)
+    res = await wa.get_whatsapp_incoming_messages(sync=False)
+    assert res["ok"] is True
+    assert client.identity.username == "MohanRaj"
+    await client.aclose()
+
+
+
 

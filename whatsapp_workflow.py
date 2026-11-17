@@ -505,25 +505,34 @@ class WhatsAppWorkflow:
     ) -> dict[str, Any]:
         status_data = await self.client.get_whatsapp_status()
         sessions_list = await self.client.list_whatsapp_sessions() if sync_sessions else None
-        session_obj, phone = self._verify_session_ownership(ident, status_data, sessions_list)
 
-        # Prefer reconciled status/phone from synced session list if available
-        if isinstance(sessions_list, list) and sessions_list and isinstance(sessions_list[0], dict):
-            synced_sess = sessions_list[0]
-            synced_owner = synced_sess.get("owner_username")
-            if (
-                not ident.is_superuser
-                and synced_owner
-                and ident.username
-                and str(synced_owner).strip() != ident.username.strip()
-            ):
-                raise AuthError("Synced WhatsApp session belongs to a different user.")
-            if synced_sess.get("phone_number"):
-                synced_phone = normalize_phone_number(str(synced_sess["phone_number"]))
-                if synced_phone:
-                    phone = synced_phone
-            if not session_obj:
-                session_obj = synced_sess
+        def _validate_owner(active_ident: Identity) -> tuple[dict[str, Any], str | None]:
+            sess_obj, extracted_phone = self._verify_session_ownership(active_ident, status_data, sessions_list)
+            if isinstance(sessions_list, list) and sessions_list and isinstance(sessions_list[0], dict):
+                synced_sess = sessions_list[0]
+                synced_owner = synced_sess.get("owner_username")
+                if (
+                    not active_ident.is_superuser
+                    and synced_owner
+                    and active_ident.username
+                    and str(synced_owner).strip() != active_ident.username.strip()
+                ):
+                    raise AuthError("Synced WhatsApp session belongs to a different user.")
+                if synced_sess.get("phone_number"):
+                    synced_phone = normalize_phone_number(str(synced_sess["phone_number"]))
+                    if synced_phone:
+                        extracted_phone = synced_phone
+                if not sess_obj:
+                    sess_obj = synced_sess
+            return sess_obj, extracted_phone
+
+        try:
+            session_obj, phone = _validate_owner(ident)
+        except AuthError:
+            # An OAuth token's cached Identity may carry the login email/alias from subject;
+            # refresh canonical username and owned sessions from /auth/me/ before rejecting.
+            ident = await self._identity(require_manage=False, refresh_from_api=True)
+            session_obj, phone = _validate_owner(ident)
 
         status_str = _extract_status(status_data)
         sess_obj_status = str(session_obj.get("status") or "").strip().upper()

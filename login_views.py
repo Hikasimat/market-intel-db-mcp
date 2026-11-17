@@ -294,7 +294,8 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                         return render_login(session_id, username, err_msg)
 
                     user_id = str(user.get("id") or user.get("pk") or "")
-                    subject = f"{user_id}:{username}"
+                    canonical_username = str(user.get("username") or username).strip() or username
+                    subject = f"{user_id}:{canonical_username}"
 
             except Exception as exc:
                 log.exception("Error during OAuth login authentication")
