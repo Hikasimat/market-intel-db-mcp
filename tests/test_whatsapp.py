@@ -1448,6 +1448,22 @@ async def test_email_login_canonical_subject_and_incoming_messages_identity_refr
     res = await wa.get_whatsapp_incoming_messages(sync=False)
     assert res["ok"] is True
     assert client.identity.username == "MohanRaj"
+
+    # 3. Re-linking with a different WhatsApp number upgrades stale QR_REQUIRED from status using synced session list
+    respx.get(f"{BASE}/whatsapp/status/").mock(return_value=httpx.Response(200, json={
+        "status": "QR_REQUIRED",
+        "phone_number": "+919003619221",
+        "session": {"session_name": "wa_u42_abc", "owner_username": "MohanRaj", "status": "QR_REQUIRED", "phone_number": "+919003619221"},
+    }))
+    respx.get(f"{BASE}/whatsapp/session/list/").mock(return_value=httpx.Response(200, json=[
+        {"id": 2, "session_name": "wa_u42_abc", "status": "READY", "phone_number": "+919360239398", "owner_username": "MohanRaj"}
+    ]))
+    st = await wa.get_whatsapp_connection_status()
+    assert st["ok"] is True
+    assert st["connected"] is True
+    assert st["status"] == "READY"
+    assert st["phone_number"] == "+919360239398"
+    assert st["identity_matched"] is True
     await client.aclose()
 
 

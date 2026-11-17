@@ -522,7 +522,8 @@ class WhatsAppWorkflow:
                     synced_phone = normalize_phone_number(str(synced_sess["phone_number"]))
                     if synced_phone:
                         extracted_phone = synced_phone
-                if not sess_obj:
+                synced_status = str(synced_sess.get("status") or "").strip().upper()
+                if not sess_obj or synced_status in CONNECTED_STATUSES:
                     sess_obj = synced_sess
             return sess_obj, extracted_phone
 
@@ -536,7 +537,12 @@ class WhatsAppWorkflow:
 
         status_str = _extract_status(status_data)
         sess_obj_status = str(session_obj.get("status") or "").strip().upper()
-        if (status_str == "UNKNOWN" or status_str in DISCONNECTED_STATUSES) and sess_obj_status in CONNECTED_STATUSES:
+        if sess_obj_status in CONNECTED_STATUSES and (
+            status_str == "UNKNOWN"
+            or status_str in DISCONNECTED_STATUSES
+            or status_str in QR_REQUIRED_STATUSES
+            or status_str in STARTING_STATUSES
+        ):
             status_str = sess_obj_status
         elif status_str == "UNKNOWN" and sess_obj_status:
             status_str = sess_obj_status
