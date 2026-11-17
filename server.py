@@ -36,7 +36,8 @@ Mandatory operating rules for Claude:
 9. Research sources and unresolved fields must be disclosed to the user.
 10. No record or WhatsApp message may be reported as created, updated, or sent without verified API confirmation.
 11. WhatsApp operations are strictly scoped to the authenticated Market Intel user's own connected session and conversations.
-12. Outbound WhatsApp messages, media sends, and session disconnects require explicit user approval via confirmation_token and user_has_explicitly_confirmed=true."""
+12. Outbound WhatsApp messages, media sends, edits, forwards, group changes, and session disconnects require explicit user approval via confirmation_token and user_has_explicitly_confirmed=true.
+13. Before replying to incoming WhatsApp messages or starting a new WhatsApp chat, call get_whatsapp_incoming_messages / get_whatsapp_chat_history / get_whatsapp_contact_details to sync live messages into Market Intel DB, match the sender/number against CRM records, and read conversation history."""
 
 PROSPECT_FIELDS_HELP = """
 Blueprint Sections:
@@ -289,7 +290,8 @@ def create_mcp(
     # --- WhatsApp Conversation Tools ---
     @mcp.tool(description=(
         "READ-ONLY. List WhatsApp chats owned by the authenticated user's connected session. "
-        "Supports optional search filter, is_group filter, matched_only filter, configurable limit (1-100), and cursor pagination."
+        "Syncs recent WAHA messages into Market Intel DB by default (sync=true) and supports search, is_group, "
+        "matched_only, limit (1-100), and cursor pagination."
     ))
     async def list_whatsapp_chats(
         search: str | None = None,
@@ -297,6 +299,7 @@ def create_mcp(
         matched_only: bool = False,
         limit: int = 25,
         cursor: str | None = None,
+        sync: bool = True,
     ) -> dict[str, Any]:
         wa = await _resolve_wa_wf()
         try:
@@ -306,14 +309,62 @@ def create_mcp(
                 matched_only=matched_only,
                 limit=limit,
                 cursor=cursor,
+                sync=sync,
             )
         finally:
             await _close_if_ephemeral(wa)
 
     @mcp.tool(description=(
-        "READ-ONLY. Retrieve persisted conversation message history from Market Intel DB for one of the "
-        "authenticated user's owned chats (by conversation_id, chat_id, or phone_number). "
-        "Includes direction, timestamps, delivery/read status, media metadata, reply_context, and cursor pagination."
+        "READ-ONLY. Sync and retrieve incoming WhatsApp messages, matched Market Intel DB contact/prospect details, "
+        "and recent conversation history (by phone_number, chat_id, sender_id, or conversation_id; or leave blank for all recent chats). "
+        "Auto-links matched Market Intel contacts to conversations and provides reply_hint with reply_to for contextual replies."
+    ))
+    async def get_whatsapp_incoming_messages(
+        phone_number: str | None = None,
+        chat_id: str | None = None,
+        sender_id: str | None = None,
+        conversation_id: str | None = None,
+        unread_only: bool = False,
+        history_limit: int = 20,
+        sync: bool = True,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.get_whatsapp_incoming_messages(
+                phone_number=phone_number,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                conversation_id=conversation_id,
+                unread_only=unread_only,
+                history_limit=history_limit,
+                sync=sync,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Synchronize recent WhatsApp messages (from WAHA into Market Intel DB) for the authenticated user's session "
+        "or a specific conversation/chat_id."
+    ))
+    async def sync_whatsapp_history(
+        days: int = 2,
+        chat_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.sync_whatsapp_history(
+                days=days,
+                chat_id=chat_id,
+                conversation_id=conversation_id,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "READ-ONLY. Retrieve persisted conversation message history from Market Intel DB (syncing new WAHA messages "
+        "first by default) for one of the authenticated user's owned chats (by conversation_id, chat_id, or phone_number). "
+        "Includes latest_message, latest_inbound_message, crm_match, direction, timestamps, media metadata, reply_context, and pagination."
     ))
     async def get_whatsapp_chat_history(
         conversation_id: str | None = None,
@@ -322,6 +373,7 @@ def create_mcp(
         page_size: int = 50,
         cursor: str | None = None,
         order: str = "asc",
+        sync: bool = True,
     ) -> dict[str, Any]:
         wa = await _resolve_wa_wf()
         try:
@@ -332,6 +384,7 @@ def create_mcp(
                 page_size=page_size,
                 cursor=cursor,
                 order=order,
+                sync=sync,
             )
         finally:
             await _close_if_ephemeral(wa)
@@ -357,7 +410,7 @@ def create_mcp(
 
     @mcp.tool(description=(
         "READ-ONLY. Search persisted WhatsApp messages strictly within the authenticated user's owned conversations. "
-        "Supports optional conversation_id/chat_id scope, direction ('INBOUND'/'OUTBOUND'), has_media filter, limit, and cursor."
+        "Supports optional conversation_id/chat_id scope, direction ('INBOUND'/'OUTBOUND'), has_media filter, sync, limit, and cursor."
     ))
     async def search_whatsapp_messages(
         query: str,
@@ -367,6 +420,7 @@ def create_mcp(
         has_media: bool | None = None,
         limit: int = 25,
         cursor: str | None = None,
+        sync: bool = False,
     ) -> dict[str, Any]:
         wa = await _resolve_wa_wf()
         try:
@@ -378,14 +432,17 @@ def create_mcp(
                 has_media=has_media,
                 limit=limit,
                 cursor=cursor,
+                sync=sync,
             )
         finally:
             await _close_if_ephemeral(wa)
 
     # --- WhatsApp Messaging Tools ---
     @mcp.tool(description=(
-        "Send a WhatsApp text message through the authenticated user's connected Market Intel session. "
-        "Call first without confirmation_token to validate the recipient/session and obtain a preview + confirmation_token; "
+        "Send or reply to a WhatsApp text message through the authenticated user's connected Market Intel session. "
+        "Matches new numbers against Market Intel DB and maintains conversation history in DB. "
+        "Pass reply_to (waha_message_id or DB message UUID) to quote/reply to a specific message, and optional mentions list. "
+        "Call first without confirmation_token to preview recipient/CRM match + confirmation_token; "
         "after explicit user approval, call again with confirmation_token and user_has_explicitly_confirmed=true."
     ))
     async def send_whatsapp_message(
@@ -394,6 +451,7 @@ def create_mcp(
         chat_id: str | None = None,
         prospect_contact_id: str | None = None,
         reply_to: str | None = None,
+        mentions: list[str] | None = None,
         confirmation_token: str | None = None,
         user_has_explicitly_confirmed: bool = False,
     ) -> dict[str, Any]:
@@ -405,6 +463,7 @@ def create_mcp(
                 chat_id=chat_id,
                 prospect_contact_id=prospect_contact_id,
                 reply_to=reply_to,
+                mentions=mentions,
                 confirmation_token=confirmation_token,
                 user_has_explicitly_confirmed=user_has_explicitly_confirmed,
             )
@@ -455,6 +514,138 @@ def create_mcp(
                 conversation_id=conversation_id,
                 chat_id=chat_id,
                 phone_number=phone_number,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Edit a previously sent outbound WhatsApp message (updates both WhatsApp/WAHA and Market Intel DB). "
+        "Call first without confirmation_token to preview before/after text; after explicit user approval, "
+        "call again with confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def edit_whatsapp_message(
+        message_id: str,
+        new_text: str,
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.edit_whatsapp_message(
+                message_id=message_id,
+                new_text=new_text,
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Forward an existing WhatsApp text or media message from an owned chat to another WhatsApp recipient, "
+        "matching target numbers against Market Intel DB and storing the forwarded message in DB. "
+        "Requires explicit confirmation via confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def forward_whatsapp_message(
+        source_message_id: str,
+        source_conversation_id: str | None = None,
+        recipient: str | None = None,
+        chat_id: str | None = None,
+        prospect_contact_id: str | None = None,
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.forward_whatsapp_message(
+                source_message_id=source_message_id,
+                source_conversation_id=source_conversation_id,
+                recipient=recipient,
+                chat_id=chat_id,
+                prospect_contact_id=prospect_contact_id,
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Create a new WhatsApp group chat with the specified group_name and participant phone numbers, "
+        "storing the group conversation in Market Intel DB. Requires explicit confirmation via "
+        "confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def create_whatsapp_group(
+        group_name: str,
+        participants: list[str],
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.create_whatsapp_group(
+                group_name=group_name,
+                participants=participants,
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Add or remove participants (`action`: 'add' or 'remove') on an owned WhatsApp group chat. "
+        "Requires explicit confirmation via confirmation_token and user_has_explicitly_confirmed=true."
+    ))
+    async def manage_whatsapp_group_participants(
+        group_chat_id: str,
+        action: str,
+        participants: list[str],
+        confirmation_token: str | None = None,
+        user_has_explicitly_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.manage_whatsapp_group_participants(
+                group_chat_id=group_chat_id,
+                action=action,
+                participants=participants,
+                confirmation_token=confirmation_token,
+                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "READ-ONLY. Retrieve or generate the WhatsApp invite link for an owned WhatsApp group."
+    ))
+    async def get_whatsapp_group_invite_link(
+        group_chat_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.get_whatsapp_group_invite_link(
+                group_chat_id=group_chat_id,
+                conversation_id=conversation_id,
+            )
+        finally:
+            await _close_if_ephemeral(wa)
+
+    @mcp.tool(description=(
+        "Associate an owned WhatsApp conversation in Market Intel DB with a matching ProspectContact (Key Person), "
+        "using explicit prospect_contact_id or automatic phone-number matching."
+    ))
+    async def link_whatsapp_conversation_to_contact(
+        conversation_id: str | None = None,
+        chat_id: str | None = None,
+        phone_number: str | None = None,
+        prospect_contact_id: str | None = None,
+    ) -> dict[str, Any]:
+        wa = await _resolve_wa_wf()
+        try:
+            return await wa.link_whatsapp_conversation_to_contact(
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                phone_number=phone_number,
+                prospect_contact_id=prospect_contact_id,
             )
         finally:
             await _close_if_ephemeral(wa)

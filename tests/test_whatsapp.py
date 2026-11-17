@@ -61,6 +61,12 @@ class FakeWhatsAppClient:
         self.conversations: list[dict[str, Any]] = []
         self.messages_by_conv: dict[str, list[dict[str, Any]]] = {}
         self.contact_info_by_chat: dict[str, dict[str, Any]] = {}
+        self.crm_contacts: list[dict[str, Any]] = []
+        self.prospects: list[dict[str, Any]] = []
+        self.media_bytes_by_msg: dict[str, tuple[bytes, str]] = {}
+        self.pending_sync_conversations: list[dict[str, Any]] = []
+        self.pending_sync_messages: dict[str, list[dict[str, Any]]] = {}
+        self.waha_status_override: str | None = None
         self.send_exc: Exception | None = None
         self.send_media_exc: Exception | None = None
         self.status_exc: Exception | None = None
@@ -97,7 +103,7 @@ class FakeWhatsAppClient:
             self.status = nxt.get("status", self.status)
             if "phone_number" in nxt:
                 self.phone_number = nxt["phone_number"]
-        return {
+        out = {
             "session": {
                 "id": 1,
                 "session_name": self.session_name,
@@ -114,6 +120,9 @@ class FakeWhatsAppClient:
                 "safety_stop_active": self.safety_stop_active,
             },
         }
+        if self.waha_status_override:
+            out["waha_status"] = {"name": self.session_name, "status": self.waha_status_override}
+        return out
 
     async def list_whatsapp_sessions(self) -> list[dict[str, Any]]:
         self.calls.append(("list_whatsapp_sessions",))
@@ -197,16 +206,159 @@ class FakeWhatsAppClient:
         }
 
     async def list_whatsapp_crm_contacts(self, search: str | None = None) -> list[dict[str, Any]]:
-        return []
+        self.calls.append(("list_whatsapp_crm_contacts", search))
+        if not search:
+            return copy.deepcopy(self.crm_contacts)
+        q = search.casefold()
+        return [
+            copy.deepcopy(c)
+            for c in self.crm_contacts
+            if any(q in str(c.get(k) or "").casefold() for k in ("contact_name", "phone_number", "company_name", "official_email"))
+        ]
+
+    async def list_prospects(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.calls.append(("list_prospects", params))
+        q = str((params or {}).get("search") or "").casefold()
+        if not q:
+            return {"results": copy.deepcopy(self.prospects)}
+        out = []
+        for p in self.prospects:
+            hay = " ".join(str(p.get(k) or "") for k in ("company_name", "official_phone_number", "official_email_address"))
+            kc_phones = " ".join(str(kc.get("phone_number") or "") for kc in p.get("key_contacts", []))
+            if q in (hay + " " + kc_phones).casefold():
+                out.append(copy.deepcopy(p))
+        return {"results": out}
+
+    async def sync_whatsapp_history(
+        self, days: int = 2, chat_id: str | None = None, session_name: str | None = None
+    ) -> dict[str, Any]:
+        self.calls.append(("sync_whatsapp_history", days, chat_id, session_name))
+        synced = 0
+        for conv in self.pending_sync_conversations:
+            if not any(existing.get("id") == conv.get("id") for existing in self.conversations):
+                self.conversations.append(copy.deepcopy(conv))
+                synced += 1
+        for cid, msgs in self.pending_sync_messages.items():
+            target_list = self.messages_by_conv.setdefault(cid, [])
+            for m in msgs:
+                if not any(ex.get("id") == m.get("id") for ex in target_list):
+                    target_list.append(copy.deepcopy(m))
+                    synced += 1
+        return {"detail": f"Synchronized {synced} messages.", "synced": synced, "days": days}
+
+    async def sync_whatsapp_conversation(self, conversation_id: str, days: int = 2) -> dict[str, Any]:
+        self.calls.append(("sync_whatsapp_conversation", conversation_id, days))
+        synced = 0
+        if conversation_id in self.pending_sync_messages:
+            target_list = self.messages_by_conv.setdefault(conversation_id, [])
+            for m in self.pending_sync_messages[conversation_id]:
+                if not any(ex.get("id") == m.get("id") for ex in target_list):
+                    target_list.append(copy.deepcopy(m))
+                    synced += 1
+        return {"detail": f"Synced {synced} messages.", "synced": synced, "days": days}
+
+    async def link_whatsapp_conversation_crm(
+        self, conversation_id: str, prospect_contact_id: str | None
+    ) -> dict[str, Any]:
+        self.calls.append(("link_whatsapp_conversation_crm", conversation_id, prospect_contact_id))
+        contact = next((c for c in self.crm_contacts if str(c.get("id")) == str(prospect_contact_id)), None)
+        for conv in self.conversations:
+            if str(conv.get("id")) == str(conversation_id):
+                conv["prospect_contact"] = prospect_contact_id
+                conv["is_matched"] = bool(prospect_contact_id)
+                if contact:
+                    conv["contact_name"] = contact.get("contact_name") or conv.get("contact_name")
+                    conv["prospect_name"] = contact.get("company_name")
+                    conv["prospect_id"] = contact.get("prospect_id")
+                return copy.deepcopy(conv)
+        raise ApiError("Conversation not found.", 404)
+
+    async def edit_whatsapp_message(self, message_id: str, text: str) -> dict[str, Any]:
+        self.calls.append(("edit_whatsapp_message", message_id, text))
+        for msgs in self.messages_by_conv.values():
+            for m in msgs:
+                if str(m.get("id")) == str(message_id):
+                    m["full_body"] = text
+                    m["body_preview"] = text[:200]
+                    m["is_edited"] = True
+                    return copy.deepcopy(m)
+        raise ApiError("Message not found.", 404)
+
+    async def create_whatsapp_group(self, name: str, participants: list[str]) -> dict[str, Any]:
+        self.calls.append(("create_whatsapp_group", name, list(participants)))
+        group_jid = f"120363{len(self.conversations) + 1}@g.us"
+        conv_id = str(uuid.uuid4())
+        conv = {
+            "id": conv_id,
+            "chat_id": group_jid,
+            "is_group": True,
+            "is_matched": True,
+            "contact_name": name,
+            "whatsapp_name": name,
+            "account_phone": self.phone_number,
+            "unread_count": 0,
+            "last_message_at": "2026-11-17T09:00:00Z",
+            "last_message_preview": f"Group created: {name}",
+            "last_message_from_me": True,
+        }
+        self.conversations.append(conv)
+        return {"group": {"id": group_jid, "name": name, "participants": participants}, "conversation": copy.deepcopy(conv)}
+
+    async def add_whatsapp_group_participants(self, chat_id: str, participants: list[str]) -> dict[str, Any]:
+        self.calls.append(("add_whatsapp_group_participants", chat_id, list(participants)))
+        return {"status": "success", "added": participants}
+
+    async def remove_whatsapp_group_participants(self, chat_id: str, participants: list[str]) -> dict[str, Any]:
+        self.calls.append(("remove_whatsapp_group_participants", chat_id, list(participants)))
+        return {"status": "success", "removed": participants}
+
+    async def get_whatsapp_group_invite_link(self, chat_id: str) -> dict[str, Any]:
+        self.calls.append(("get_whatsapp_group_invite_link", chat_id))
+        return {"code": "AbCdEf123", "link": "https://chat.whatsapp.com/AbCdEf123"}
+
+    async def download_whatsapp_media(self, message_id: str) -> tuple[bytes, str]:
+        self.calls.append(("download_whatsapp_media", message_id))
+        if message_id in self.media_bytes_by_msg:
+            return self.media_bytes_by_msg[message_id]
+        raise ApiError("Media not found.", 404)
 
     async def send_whatsapp_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("send_whatsapp_message", copy.deepcopy(payload)))
         if self.send_exc:
             raise self.send_exc
         msg_id = str(uuid.uuid4())
-        return {
+        chat_id = payload.get("chat_id")
+        contact_id = payload.get("prospect_contact_id")
+        matched_contact = next((c for c in self.crm_contacts if str(c.get("id")) == str(contact_id)), None) if contact_id else None
+        if not chat_id and matched_contact and matched_contact.get("phone_number"):
+            digits = normalize_phone_digits(matched_contact["phone_number"])
+            chat_id = f"{digits}@c.us"
+        conv = next(
+            (c for c in self.conversations if (chat_id and c.get("chat_id") == chat_id) or (contact_id and str(c.get("prospect_contact")) == str(contact_id))),
+            None,
+        )
+        if not conv and chat_id:
+            conv = {
+                "id": str(uuid.uuid4()),
+                "chat_id": chat_id,
+                "phone_number": normalize_phone_number(chat_id),
+                "is_group": chat_id.endswith("@g.us"),
+                "is_matched": bool(matched_contact),
+                "prospect_contact": str(matched_contact["id"]) if matched_contact else None,
+                "prospect_id": matched_contact.get("prospect_id") if matched_contact else None,
+                "prospect_name": matched_contact.get("company_name") if matched_contact else None,
+                "contact_name": matched_contact.get("contact_name") if matched_contact else normalize_phone_number(chat_id),
+                "whatsapp_name": matched_contact.get("contact_name") if matched_contact else "",
+                "account_phone": self.phone_number,
+                "unread_count": 0,
+                "last_message_at": "2026-11-16T12:00:00Z",
+                "last_message_preview": payload["message_body"][:200],
+                "last_message_from_me": True,
+            }
+            self.conversations.append(conv)
+        msg_obj = {
             "id": msg_id,
-            "waha_message_id": f"true_{payload.get('chat_id', 'x')}_MSG1",
+            "waha_message_id": f"true_{chat_id or 'x'}_MSG1",
             "direction": "OUTBOUND",
             "status": "SENT",
             "body_preview": payload["message_body"][:200],
@@ -220,6 +372,9 @@ class FakeWhatsAppClient:
             "is_edited": False,
             "reply_context": {"id": payload["reply_to"]} if payload.get("reply_to") else None,
         }
+        if conv:
+            self.messages_by_conv.setdefault(conv["id"], []).append(copy.deepcopy(msg_obj))
+        return msg_obj
 
     async def send_whatsapp_media(
         self, chat_id: str, filename: str, content: bytes, mime_type: str, caption: str = ""
@@ -943,6 +1098,301 @@ async def test_hosted_qr_url_and_http_view_handlers():
     assert await run_mw("GET", f"/whatsapp/qr/{token}") == 200
     assert await run_mw("POST", f"/whatsapp/qr/{token}") == 401
     assert await run_mw("GET", "/mcp") == 401
+
+
+async def test_disconnect_works_when_db_status_stale_but_waha_working(wa_settings):
+    c = FakeWhatsAppClient(status="DISCONNECTED")
+    c.waha_status_override = "WORKING"
+    wa = _make_wa(c, wa_settings)
+
+    stage = await wa.disconnect_whatsapp()
+    assert stage["requires_confirmation"] is True
+    assert ("list_whatsapp_sessions",) in c.calls
+
+    done = await wa.disconnect_whatsapp(confirmation_token=stage["confirmation_token"], user_has_explicitly_confirmed=True)
+    assert done["disconnected"] is True
+
+
+async def test_incoming_hi_from_2356897845_syncs_matches_crm_and_replies_with_reply_to(wa_settings):
+    conv_id = str(uuid.uuid4())
+    in_msg_id = str(uuid.uuid4())
+    contact_id = str(uuid.uuid4())
+    prospect_id = str(uuid.uuid4())
+
+    c = FakeWhatsAppClient(status="READY")
+    c.crm_contacts = [
+        {
+            "id": contact_id,
+            "contact_name": "Kiran Rao",
+            "designation": "Head of Operations",
+            "phone_number": "+91 23568-97845",
+            "official_email": "kiran@vortexen.example",
+            "company_name": "Vortexen Corp",
+            "prospect_id": prospect_id,
+        }
+    ]
+    c.prospects = [
+        {
+            "id": prospect_id,
+            "company_name": "Vortexen Corp",
+            "country_head_office": "India",
+            "primary_industries": "Renewable Energy",
+            "official_phone_number": "+91 23568-97845",
+            "official_email_address": "info@vortexen.example",
+            "operational_status": "Active",
+        }
+    ]
+    # Simulate an incoming message waiting in WAHA sync buffer (not in DB yet until synced)
+    c.pending_sync_conversations = [
+        {
+            "id": conv_id,
+            "chat_id": "912356897845@c.us",
+            "phone_number": "+912356897845",
+            "is_group": False,
+            "is_matched": False,
+            "prospect_contact": None,
+            "contact_name": "+912356897845",
+            "whatsapp_name": "Kiran",
+            "account_phone": "+919876543210",
+            "unread_count": 1,
+            "last_message_at": "2026-11-17T08:30:00Z",
+            "last_message_preview": "Hi",
+            "last_message_from_me": False,
+        }
+    ]
+    c.pending_sync_messages[conv_id] = [
+        {
+            "id": in_msg_id,
+            "waha_message_id": "false_912356897845@c.us_INBOUND_HI",
+            "direction": "INBOUND",
+            "status": "RECEIVED",
+            "body_preview": "Hi",
+            "full_body": "Hi",
+            "message_type": "chat",
+            "waha_timestamp": "2026-11-17T08:30:00Z",
+            "created_at": "2026-11-17T08:30:00Z",
+            "has_media": False,
+            "is_edited": False,
+        }
+    ]
+    wa = _make_wa(c, wa_settings)
+
+    incoming = await wa.get_whatsapp_incoming_messages(phone_number="2356897845")
+    assert incoming["ok"] is True
+    assert len(incoming["conversations"]) == 1
+    entry = incoming["conversations"][0]
+    assert entry["latest_inbound_message"]["body"] == "Hi"
+    assert entry["crm_match"]["matched"] is True
+    assert entry["crm_match"]["contact_name"] == "Kiran Rao"
+    assert entry["crm_match"]["company_name"] == "Vortexen Corp"
+    # Auto-linked in Market Intel DB
+    assert entry["conversation"]["is_matched"] is True
+    assert entry["conversation"]["prospect_contact_id"] == contact_id
+    assert entry["reply_hint"]["reply_to"] == "false_912356897845@c.us_INBOUND_HI"
+
+    # Reply referencing the DB message UUID -> resolves to waha_message_id and preserves reply_to!
+    staged = await wa.send_whatsapp_message(
+        recipient="2356897845",
+        message_body="Hi Kiran! Happy to help you with Vortexen Corp details.",
+        reply_to=in_msg_id,
+    )
+    assert staged["requires_confirmation"] is True
+    assert staged["preview"]["reply_to"] == "false_912356897845@c.us_INBOUND_HI"
+    assert staged["preview"]["crm_match"]["contact_name"] == "Kiran Rao"
+
+    sent = await wa.send_whatsapp_message(
+        confirmation_token=staged["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert sent["sent"] is True
+    assert sent["message"]["reply_context"]["id"] == "false_912356897845@c.us_INBOUND_HI"
+    # Check sent payload did NOT pass prospect_contact_id when reply_to is set (so Django sends quoted reply)
+    send_calls = [call[1] for call in c.calls if call[0] == "send_whatsapp_message"]
+    assert send_calls[-1]["reply_to"] == "false_912356897845@c.us_INBOUND_HI"
+    assert "prospect_contact_id" not in send_calls[-1]
+
+
+async def test_new_number_first_message_checks_market_intel_db_and_persists_conversation(wa_settings):
+    contact_id = str(uuid.uuid4())
+    prospect_id = str(uuid.uuid4())
+    c = FakeWhatsAppClient(status="READY")
+    c.crm_contacts = [
+        {
+            "id": contact_id,
+            "contact_name": "Meera Nair",
+            "designation": "Director",
+            "phone_number": "+91 23568-97845",
+            "official_email": "meera@acme.example",
+            "company_name": "Acme Solar",
+            "prospect_id": prospect_id,
+        }
+    ]
+    wa = _make_wa(c, wa_settings)
+
+    staged = await wa.send_whatsapp_message(
+        recipient="2356897845",
+        message_body="Hello Meera, following up from Market Intel.",
+    )
+    assert staged["requires_confirmation"] is True
+    assert staged["preview"]["prospect_contact_id"] == contact_id
+    assert staged["preview"]["crm_match"]["company_name"] == "Acme Solar"
+
+    sent = await wa.send_whatsapp_message(
+        confirmation_token=staged["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert sent["sent"] is True
+    assert sent["conversation"]["is_matched"] is True
+    assert sent["conversation"]["prospect_contact_id"] == contact_id
+    # Subsequent history read finds the new persisted conversation and message
+    hist = await wa.get_whatsapp_chat_history(phone_number="2356897845")
+    assert hist["ok"] is True
+    assert hist["latest_message"]["body"] == "Hello Meera, following up from Market Intel."
+
+
+async def test_edit_forward_and_group_actions_and_delete_blocked(wa_settings):
+    from api_client import EndpointNotAllowed, MarketIntelClient
+
+    conv1_id = str(uuid.uuid4())
+    out_msg_id = str(uuid.uuid4())
+    in_msg_id = str(uuid.uuid4())
+    media_msg_id = str(uuid.uuid4())
+    c = FakeWhatsAppClient(status="READY")
+    c.conversations = [
+        {
+            "id": conv1_id,
+            "chat_id": "919000011111@c.us",
+            "phone_number": "+919000011111",
+            "is_group": False,
+            "is_matched": False,
+            "contact_name": "Ravi",
+            "account_phone": "+919876543210",
+            "last_message_at": "2026-11-17T08:00:00Z",
+        }
+    ]
+    c.messages_by_conv[conv1_id] = [
+        {
+            "id": out_msg_id,
+            "waha_message_id": "true_919000011111@c.us_OUT1",
+            "direction": "OUTBOUND",
+            "status": "SENT",
+            "body_preview": "Draft proposal",
+            "full_body": "Draft proposal",
+            "waha_timestamp": "2026-11-17T08:00:00Z",
+            "created_at": "2026-11-17T08:00:00Z",
+            "has_media": False,
+        },
+        {
+            "id": in_msg_id,
+            "waha_message_id": "false_919000011111@c.us_IN1",
+            "direction": "INBOUND",
+            "status": "RECEIVED",
+            "body_preview": "Looks good!",
+            "full_body": "Looks good!",
+            "waha_timestamp": "2026-11-17T08:05:00Z",
+            "created_at": "2026-11-17T08:05:00Z",
+            "has_media": False,
+        },
+        {
+            "id": media_msg_id,
+            "waha_message_id": "false_919000011111@c.us_MED1",
+            "direction": "INBOUND",
+            "status": "RECEIVED",
+            "body_preview": "Brochure",
+            "full_body": "Brochure",
+            "waha_timestamp": "2026-11-17T08:06:00Z",
+            "created_at": "2026-11-17T08:06:00Z",
+            "has_media": True,
+            "media_mime_type": "application/pdf",
+            "media_file": "media/brochure.pdf",
+        },
+    ]
+    c.media_bytes_by_msg[media_msg_id] = (b"%PDF-1.4 fake pdf", "application/pdf")
+    wa = _make_wa(c, wa_settings)
+
+    # 1. Edit outbound message (confirmed); reject editing inbound messages
+    bad_edit = await wa.edit_whatsapp_message(in_msg_id, "Tamper")
+    assert bad_edit["edited"] is False and "outbound" in bad_edit["errors"][0].lower()
+
+    edit_stage = await wa.edit_whatsapp_message(out_msg_id, "Final proposal")
+    assert edit_stage["requires_confirmation"] is True
+    assert edit_stage["preview"]["before_text"] == "Draft proposal"
+    assert edit_stage["preview"]["after_text"] == "Final proposal"
+    edit_done = await wa.edit_whatsapp_message(
+        out_msg_id, "Final proposal",
+        confirmation_token=edit_stage["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert edit_done["edited"] is True and edit_done["message"]["body"] == "Final proposal"
+
+    # 2. Forward text message AND media message
+    fwd_txt_stage = await wa.forward_whatsapp_message(
+        source_message_id=in_msg_id,
+        source_conversation_id=conv1_id,
+        recipient="919888877777",
+    )
+    assert fwd_txt_stage["requires_confirmation"] is True
+    fwd_txt_done = await wa.forward_whatsapp_message(
+        source_message_id=in_msg_id,
+        confirmation_token=fwd_txt_stage["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert fwd_txt_done["forwarded"] is True and fwd_txt_done["message"]["body"] == "Looks good!"
+
+    fwd_med_stage = await wa.forward_whatsapp_message(
+        source_message_id=media_msg_id,
+        source_conversation_id=conv1_id,
+        recipient="919888877777",
+    )
+    assert fwd_med_stage["requires_confirmation"] is True and fwd_med_stage["preview"]["has_media"] is True
+    fwd_med_done = await wa.forward_whatsapp_message(
+        source_message_id=media_msg_id,
+        confirmation_token=fwd_med_stage["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert fwd_med_done["forwarded"] is True
+    assert any(call[0] == "send_whatsapp_media" and call[2] == "brochure.pdf" for call in c.calls)
+
+    # 3. Create group, add/remove participants, invite link
+    grp_stage = await wa.create_whatsapp_group("Sales Ops", ["+919000011111", "919888877777"])
+    assert grp_stage["requires_confirmation"] is True
+    grp_done = await wa.create_whatsapp_group(
+        "Sales Ops", ["+919000011111"],
+        confirmation_token=grp_stage["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert grp_done["created"] is True
+    group_jid = grp_done["conversation"]["chat_id"]
+
+    add_stage = await wa.manage_whatsapp_group_participants(group_jid, "add", ["+919111122222"])
+    add_done = await wa.manage_whatsapp_group_participants(
+        group_jid, "add", ["+919111122222"],
+        confirmation_token=add_stage["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert add_done["updated"] is True and add_done["action"] == "add"
+
+    rem_stage = await wa.manage_whatsapp_group_participants(group_jid, "remove", ["+919111122222"])
+    rem_done = await wa.manage_whatsapp_group_participants(
+        group_jid, "remove", ["+919111122222"],
+        confirmation_token=rem_stage["confirmation_token"],
+        user_has_explicitly_confirmed=True,
+    )
+    assert rem_done["updated"] is True and rem_done["action"] == "remove"
+
+    inv = await wa.get_whatsapp_group_invite_link(group_chat_id=group_jid)
+    assert inv["ok"] is True and inv["invite_link"].startswith("https://chat.whatsapp.com/")
+
+    # 4. Sync history tool & strict NO DELETE enforcement
+    sync_res = await wa.sync_whatsapp_history(days=2)
+    assert sync_res["ok"] is True
+
+    raw_client = MarketIntelClient(wa_settings, access_token="tok")
+    with pytest.raises(EndpointNotAllowed):
+        await raw_client._send("DELETE", f"/whatsapp/conversations/{conv1_id}/")
+    with pytest.raises(EndpointNotAllowed):
+        await raw_client._send("DELETE", f"/whatsapp/messages/{out_msg_id}/")
+    await raw_client.aclose()
 
 
 

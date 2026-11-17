@@ -37,6 +37,21 @@ WHATSAPP_CONV_MESSAGES_RE = re.compile(
 WHATSAPP_CONV_READ_RE = re.compile(
     r"^/whatsapp/conversations/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/read/$"
 )
+WHATSAPP_CONV_SYNC_RE = re.compile(
+    r"^/whatsapp/conversations/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/sync/$"
+)
+WHATSAPP_CONV_LINK_CRM_RE = re.compile(
+    r"^/whatsapp/conversations/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/link-crm/$"
+)
+WHATSAPP_MSG_EDIT_RE = re.compile(
+    r"^/whatsapp/messages/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/edit/$"
+)
+WHATSAPP_GROUP_PARTICIPANTS_RE = re.compile(
+    r"^/whatsapp/groups/(?:[0-9a-zA-Z_\-\.]+@g\.us|crm_group_[0-9a-zA-Z_\-]+)/participants/(?:add|remove)/$"
+)
+WHATSAPP_GROUP_INVITE_RE = re.compile(
+    r"^/whatsapp/groups/(?:[0-9a-zA-Z_\-\.]+@g\.us|crm_group_[0-9a-zA-Z_\-]+)/invite-link/$"
+)
 WHATSAPP_CONTACT_INFO_RE = re.compile(
     r"^/whatsapp/contact-info/(?:[0-9a-zA-Z_\-\.]+@(?:c\.us|g\.us|lid|s\.whatsapp\.net)|crm_group_[0-9a-zA-Z_\-]+)/$"
 )
@@ -53,7 +68,7 @@ ALLOWED_STATIC_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/auth/me/"),
     ("POST", "/email-verifications/instant-verify/"),
     ("POST", "/email-verifications/verify/"),
-    # WhatsApp endpoints (Market Intel DB REST API)
+    # WhatsApp endpoints (Market Intel DB REST API; message/conversation DELETE excluded)
     ("GET", "/whatsapp/status/"),
     ("GET", "/whatsapp/session/list/"),
     ("POST", "/whatsapp/session/start/"),
@@ -61,6 +76,9 @@ ALLOWED_STATIC_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/whatsapp/qr/"),
     ("GET", "/whatsapp/conversations/"),
     ("GET", "/whatsapp/crm-contacts/"),
+    ("GET", "/whatsapp/media-proxy/"),
+    ("POST", "/whatsapp/sync-history/"),
+    ("POST", "/whatsapp/groups/create/"),
     ("POST", "/whatsapp/send/"),
     ("POST", "/whatsapp/send-media/"),
 })
@@ -81,6 +99,16 @@ def is_endpoint_allowed(method: str, path: str) -> bool:
         return True
     if method == "POST" and WHATSAPP_CONV_READ_RE.match(path):
         return True
+    if method == "POST" and WHATSAPP_CONV_SYNC_RE.match(path):
+        return True
+    if method == "POST" and WHATSAPP_CONV_LINK_CRM_RE.match(path):
+        return True
+    if method == "POST" and WHATSAPP_MSG_EDIT_RE.match(path):
+        return True
+    if method == "POST" and WHATSAPP_GROUP_PARTICIPANTS_RE.match(path):
+        return True
+    if method == "GET" and WHATSAPP_GROUP_INVITE_RE.match(path):
+        return True
     if method == "GET" and WHATSAPP_CONTACT_INFO_RE.match(path):
         return True
     return False
@@ -93,6 +121,7 @@ def is_retry_safe(method: str, path: str) -> bool:
         return True
     return False
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_MEDIA_PROXY_BYTES = 26_000_000
 ERROR_TEXT_LIMIT = 1000
 TOKEN_KEYS = ("access", "access_token", "token")
 
@@ -192,7 +221,7 @@ class MarketIntelClient:
         await self._http.aclose()
 
     # ------------------------------------------------------------ low level
-    async def _send(self, method: str, path: str, *, params=None, body=None, data=None, files=None, auth=True) -> Any:
+    async def _request(self, method: str, path: str, *, params=None, body=None, data=None, files=None, auth=True) -> httpx.Response:
         if not is_endpoint_allowed(method, path):
             raise EndpointNotAllowed(f"{method} {path} is not permitted by this MCP server.")
         if auth and not self._token:
@@ -222,7 +251,20 @@ class MarketIntelClient:
                 reauthed = True
                 await self._reauthenticate()
                 continue
-            return self._parse(resp, path)
+            return resp
+
+    async def _send(self, method: str, path: str, *, params=None, body=None, data=None, files=None, auth=True) -> Any:
+        resp = await self._request(method, path, params=params, body=body, data=data, files=files, auth=auth)
+        return self._parse(resp, path)
+
+    async def _send_bytes(self, method: str, path: str, *, params=None, auth=True) -> tuple[bytes, str]:
+        resp = await self._request(method, path, params=params, auth=auth)
+        if len(resp.content) > MAX_MEDIA_PROXY_BYTES:
+            raise ApiError(f"Media response from {path} exceeded the size limit.", resp.status_code)
+        if resp.status_code >= 400:
+            self._parse(resp, path)
+        mime_type = (resp.headers.get("content-type") or "application/octet-stream").split(";")[0].strip().lower()
+        return resp.content, mime_type
 
     @staticmethod
     def _parse(resp: httpx.Response, path: str) -> Any:
@@ -499,3 +541,68 @@ class MarketIntelClient:
             data["caption"] = caption
         files = {"file": (filename, content, mime_type)}
         return await self._send("POST", "/whatsapp/send-media/", data=data, files=files)
+
+    async def sync_whatsapp_history(
+        self,
+        days: int = 2,
+        chat_id: str | None = None,
+        session_name: str | None = None,
+    ) -> Any:
+        body: dict[str, Any] = {"days": days}
+        if chat_id:
+            body["chat_id"] = chat_id
+        if session_name:
+            body["session_name"] = session_name
+        return await self._send("POST", "/whatsapp/sync-history/", body=body)
+
+    async def sync_whatsapp_conversation(self, conversation_id: str, days: int = 2) -> Any:
+        return await self._send(
+            "POST",
+            f"/whatsapp/conversations/{conversation_id}/sync/",
+            body={"days": days},
+        )
+
+    async def link_whatsapp_conversation_crm(
+        self,
+        conversation_id: str,
+        prospect_contact_id: str | None,
+    ) -> Any:
+        return await self._send(
+            "POST",
+            f"/whatsapp/conversations/{conversation_id}/link-crm/",
+            body={"prospect_contact_id": prospect_contact_id},
+        )
+
+    async def edit_whatsapp_message(self, message_id: str, text: str) -> Any:
+        return await self._send(
+            "POST",
+            f"/whatsapp/messages/{message_id}/edit/",
+            body={"text": text},
+        )
+
+    async def create_whatsapp_group(self, name: str, participants: list[str]) -> Any:
+        return await self._send(
+            "POST",
+            "/whatsapp/groups/create/",
+            body={"name": name, "participants": participants},
+        )
+
+    async def add_whatsapp_group_participants(self, chat_id: str, participants: list[str]) -> Any:
+        return await self._send(
+            "POST",
+            f"/whatsapp/groups/{chat_id}/participants/add/",
+            body={"participants": participants},
+        )
+
+    async def remove_whatsapp_group_participants(self, chat_id: str, participants: list[str]) -> Any:
+        return await self._send(
+            "POST",
+            f"/whatsapp/groups/{chat_id}/participants/remove/",
+            body={"participants": participants},
+        )
+
+    async def get_whatsapp_group_invite_link(self, chat_id: str) -> Any:
+        return await self._send("GET", f"/whatsapp/groups/{chat_id}/invite-link/")
+
+    async def download_whatsapp_media(self, message_id: str) -> tuple[bytes, str]:
+        return await self._send_bytes("GET", "/whatsapp/media-proxy/", params={"message_id": message_id})

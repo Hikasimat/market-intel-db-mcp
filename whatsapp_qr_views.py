@@ -218,3 +218,4 @@ def create_qr_image_handler(qr_store: EphemeralQRStore) -> Any:
         return Response(content=rec.image_bytes, media_type=rec.mime_type, headers=dict(_SECURITY_HEADERS))
 
     return qr_image_handler
+

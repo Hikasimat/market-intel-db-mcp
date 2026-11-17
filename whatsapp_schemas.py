@@ -14,6 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 VALID_CHAT_ID_RE = re.compile(
     r"^(?:[0-9a-zA-Z_\-\.]+@(?:c\.us|g\.us|lid|s\.whatsapp\.net)|crm_group_[0-9a-zA-Z_\-]+)$"
 )
+VALID_GROUP_CHAT_ID_RE = re.compile(
+    r"^(?:[0-9a-zA-Z_\-\.]+@g\.us|crm_group_[0-9a-zA-Z_\-]+)$"
+)
 SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ \-]{0,199}$")
 
 ALLOWED_MEDIA_MIME_PREFIXES = ("image/", "audio/", "video/")
@@ -126,6 +129,14 @@ def validate_chat_id(chat_id: str) -> str:
     return cleaned
 
 
+def validate_group_chat_id(chat_id: str) -> str:
+    """Validate a WhatsApp group or CRM group chat JID."""
+    cleaned = validate_chat_id(chat_id)
+    if not VALID_GROUP_CHAT_ID_RE.match(cleaned):
+        raise ValueError("group_chat_id must be a valid group JID ending in '@g.us' or 'crm_group_...'.")
+    return cleaned
+
+
 def phone_to_chat_id(phone: str) -> str:
     """Convert a raw phone number into a validated '<digits>@c.us' chat ID."""
     digits = normalize_phone_digits(phone)
@@ -227,6 +238,7 @@ class WhatsAppListChatsInput(_Strict):
     matched_only: bool = False
     limit: int = Field(default=25, ge=1, le=100)
     cursor: Optional[str] = Field(default=None, max_length=256)
+    sync: bool = True
 
     _search = field_validator("search", mode="before")(_blank_to_none)
     _cursor = field_validator("cursor", mode="before")(_blank_to_none)
@@ -239,6 +251,7 @@ class WhatsAppChatHistoryInput(_Strict):
     page_size: int = Field(default=50, ge=1, le=200)
     cursor: Optional[str] = Field(default=None, max_length=256)
     order: Literal["asc", "desc"] = "asc"
+    sync: bool = True
 
     _chat_id = field_validator("chat_id", mode="before")(_blank_to_none)
     _phone = field_validator("phone_number", mode="before")(_blank_to_none)
@@ -318,10 +331,19 @@ class WhatsAppSendMessageInput(_Strict):
     prospect_contact_id: Optional[UUID] = None
     message_body: str = Field(min_length=1, max_length=4096)
     reply_to: Optional[str] = Field(default=None, max_length=255)
+    mentions: Optional[list[str]] = Field(default=None, max_length=50)
 
     _recipient = field_validator("recipient", mode="before")(_blank_to_none)
     _chat_id = field_validator("chat_id", mode="before")(_blank_to_none)
     _reply_to = field_validator("reply_to", mode="before")(_blank_to_none)
+
+    @field_validator("mentions")
+    @classmethod
+    def _val_mentions(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return None
+        cleaned = [str(item).strip() for item in v if str(item).strip()]
+        return cleaned or None
 
     @field_validator("chat_id")
     @classmethod
@@ -407,6 +429,168 @@ class WhatsAppMarkReadInput(_Strict):
     def _require_target(self):
         if not (self.conversation_id or self.chat_id or self.phone_number):
             raise ValueError("Provide at least one of conversation_id, chat_id, or phone_number.")
+        return self
+
+
+class WhatsAppSyncHistoryInput(_Strict):
+    days: int = Field(default=2, ge=1, le=30)
+    chat_id: Optional[str] = Field(default=None, max_length=100)
+    conversation_id: Optional[UUID] = None
+
+    _chat_id = field_validator("chat_id", mode="before")(_blank_to_none)
+
+    @field_validator("chat_id")
+    @classmethod
+    def _val_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        return validate_chat_id(v) if v is not None else None
+
+
+class WhatsAppIncomingMessagesInput(_Strict):
+    phone_number: Optional[str] = Field(default=None, max_length=40)
+    chat_id: Optional[str] = Field(default=None, max_length=100)
+    sender_id: Optional[str] = Field(default=None, max_length=100)
+    conversation_id: Optional[UUID] = None
+    unread_only: bool = False
+    history_limit: int = Field(default=20, ge=1, le=100)
+    sync: bool = True
+
+    _phone = field_validator("phone_number", mode="before")(_blank_to_none)
+    _chat_id = field_validator("chat_id", mode="before")(_blank_to_none)
+    _sender_id = field_validator("sender_id", mode="before")(_blank_to_none)
+
+    @field_validator("chat_id")
+    @classmethod
+    def _val_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        return validate_chat_id(v) if v is not None else None
+
+    @field_validator("phone_number")
+    @classmethod
+    def _val_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not normalize_phone_digits(v):
+            raise ValueError("must be a valid phone number (7-15 digits).")
+        return normalize_phone_number(v)
+
+
+class WhatsAppEditMessageInput(_Strict):
+    message_id: UUID
+    new_text: str = Field(min_length=1, max_length=4096)
+
+
+class WhatsAppForwardMessageInput(_Strict):
+    source_message_id: UUID
+    source_conversation_id: Optional[UUID] = None
+    recipient: Optional[str] = Field(default=None, max_length=100)
+    chat_id: Optional[str] = Field(default=None, max_length=100)
+    prospect_contact_id: Optional[UUID] = None
+
+    _recipient = field_validator("recipient", mode="before")(_blank_to_none)
+    _chat_id = field_validator("chat_id", mode="before")(_blank_to_none)
+
+    @field_validator("chat_id")
+    @classmethod
+    def _val_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        return validate_chat_id(v) if v is not None else None
+
+    @model_validator(mode="after")
+    def _validate_target(self):
+        if not (self.recipient or self.chat_id or self.prospect_contact_id):
+            raise ValueError("Provide recipient (phone number or chat JID), chat_id, or prospect_contact_id.")
+        if self.recipient and not self.chat_id:
+            self.chat_id = resolve_chat_id_input(chat_id=self.recipient)
+        return self
+
+
+def _normalize_participants_list(raw_list: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in raw_list:
+        val = str(p or "").strip()
+        if not val:
+            continue
+        digits = normalize_phone_digits(val)
+        if not digits:
+            raise ValueError(f"Participant {val!r} must be a valid phone number (7-15 digits).")
+        if digits not in seen:
+            seen.add(digits)
+            out.append(digits)
+    if not out:
+        raise ValueError("At least one valid participant phone number is required.")
+    return out
+
+
+class WhatsAppCreateGroupInput(_Strict):
+    group_name: str = Field(min_length=1, max_length=100)
+    participants: list[str] = Field(min_length=1, max_length=50)
+
+    @field_validator("participants")
+    @classmethod
+    def _val_participants(cls, v: list[str]) -> list[str]:
+        return _normalize_participants_list(v)
+
+
+class WhatsAppManageGroupParticipantsInput(_Strict):
+    group_chat_id: str = Field(min_length=4, max_length=100)
+    action: Literal["add", "remove"]
+    participants: list[str] = Field(min_length=1, max_length=50)
+
+    @field_validator("group_chat_id")
+    @classmethod
+    def _val_group(cls, v: str) -> str:
+        return validate_group_chat_id(v)
+
+    @field_validator("participants")
+    @classmethod
+    def _val_participants(cls, v: list[str]) -> list[str]:
+        return _normalize_participants_list(v)
+
+
+class WhatsAppGroupInviteLinkInput(_Strict):
+    group_chat_id: Optional[str] = Field(default=None, max_length=100)
+    conversation_id: Optional[UUID] = None
+
+    _group_chat_id = field_validator("group_chat_id", mode="before")(_blank_to_none)
+
+    @field_validator("group_chat_id")
+    @classmethod
+    def _val_group(cls, v: Optional[str]) -> Optional[str]:
+        return validate_group_chat_id(v) if v is not None else None
+
+    @model_validator(mode="after")
+    def _require_target(self):
+        if not (self.group_chat_id or self.conversation_id):
+            raise ValueError("Provide group_chat_id or conversation_id.")
+        return self
+
+
+class WhatsAppLinkCRMInput(_Strict):
+    conversation_id: Optional[UUID] = None
+    chat_id: Optional[str] = Field(default=None, max_length=100)
+    phone_number: Optional[str] = Field(default=None, max_length=40)
+    prospect_contact_id: Optional[UUID] = None
+
+    _chat_id = field_validator("chat_id", mode="before")(_blank_to_none)
+    _phone = field_validator("phone_number", mode="before")(_blank_to_none)
+
+    @field_validator("chat_id")
+    @classmethod
+    def _val_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        return validate_chat_id(v) if v is not None else None
+
+    @field_validator("phone_number")
+    @classmethod
+    def _val_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not normalize_phone_digits(v):
+            raise ValueError("must be a valid phone number (7-15 digits).")
+        return normalize_phone_number(v)
+
+    @model_validator(mode="after")
+    def _require_target(self):
+        if not (self.conversation_id or self.chat_id or self.phone_number):
+            raise ValueError("Provide conversation_id, chat_id, or phone_number.")
         return self
 
 

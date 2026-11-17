@@ -44,4 +44,12 @@ async def test_stdio_discovery_lists_all_tools():
                 "send_whatsapp_message",
                 "send_whatsapp_media",
                 "mark_whatsapp_chat_read",
+                "sync_whatsapp_history",
+                "get_whatsapp_incoming_messages",
+                "edit_whatsapp_message",
+                "forward_whatsapp_message",
+                "create_whatsapp_group",
+                "manage_whatsapp_group_participants",
+                "get_whatsapp_group_invite_link",
+                "link_whatsapp_conversation_to_contact",
             }

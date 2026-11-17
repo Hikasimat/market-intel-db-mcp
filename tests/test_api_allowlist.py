@@ -32,7 +32,8 @@ def test_allowlist_is_exactly_the_approved_set():
         ("GET", "/whatsapp/status/"), ("GET", "/whatsapp/session/list/"),
         ("POST", "/whatsapp/session/start/"), ("POST", "/whatsapp/session/logout/"),
         ("GET", "/whatsapp/qr/"), ("GET", "/whatsapp/conversations/"),
-        ("GET", "/whatsapp/crm-contacts/"),
+        ("GET", "/whatsapp/crm-contacts/"), ("GET", "/whatsapp/media-proxy/"),
+        ("POST", "/whatsapp/sync-history/"), ("POST", "/whatsapp/groups/create/"),
         ("POST", "/whatsapp/send/"), ("POST", "/whatsapp/send-media/"),
     }
     assert not {m for m, _ in ALLOWED_ENDPOINTS} & {"PUT", "PATCH", "DELETE"}
@@ -51,6 +52,9 @@ def test_allowlist_is_exactly_the_approved_set():
     ("POST", "/whatsapp/webhook/"),
     ("DELETE", "/whatsapp/conversations/11111111-1111-1111-1111-111111111111/"),
     ("DELETE", "/whatsapp/messages/11111111-1111-1111-1111-111111111111/"),
+    ("DELETE", "/whatsapp/messages/11111111-1111-1111-1111-111111111111/edit/"),
+    ("GET", "/whatsapp/messages/11111111-1111-1111-1111-111111111111/edit/"),
+    ("GET", "/whatsapp/groups/12345@c.us/invite-link/"),
     ("GET", "/whatsapp/contact-info/../users/"),
     ("GET", "/whatsapp/conversations/not-a-uuid/messages/"),
     ("POST", "/whatsapp/config/"),
@@ -76,6 +80,11 @@ def test_no_public_method_exposes_raw_requests():
         "get_whatsapp_conversation_messages", "mark_whatsapp_conversation_read",
         "get_whatsapp_contact_info", "list_whatsapp_crm_contacts",
         "send_whatsapp_message", "send_whatsapp_media",
+        "sync_whatsapp_history", "sync_whatsapp_conversation",
+        "link_whatsapp_conversation_crm", "edit_whatsapp_message",
+        "create_whatsapp_group", "add_whatsapp_group_participants",
+        "remove_whatsapp_group_participants", "get_whatsapp_group_invite_link",
+        "download_whatsapp_media",
     }
 
 
