@@ -205,6 +205,54 @@ async def test_login_view_get_and_post_success(tmp_store, dummy_settings):
         assert tmp_store.get_auth_session("sess_test_123") is None
 
 
+def _post_scope():
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/login",
+        "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+        "query_string": b"",
+    }
+
+
+@pytest.mark.asyncio
+async def test_login_csp_has_no_form_action_and_me_error_shows_status(dummy_settings, tmp_store):
+    """form-action 'self' makes Chrome block the 302 OAuth callback after POST /login."""
+    tmp_store.save_auth_session(
+        session_id="sess_csp", client_id="cid", redirect_uri="https://grok.com/callback",
+        state="st", code_challenge="chal", scopes=[], resource=None,
+    )
+    handler = create_login_handler(tmp_store, dummy_settings)
+
+    get_req = Request({"type": "http", "method": "GET", "path": "/login", "headers": [],
+                       "query_string": b"session_id=sess_csp"})
+    resp = await handler(get_req)
+    assert "form-action" not in resp.headers["content-security-policy"]
+
+    with respx.mock(base_url=dummy_settings.api_base_url) as m:
+        m.post("/auth/login/").respond(200, json={"access": "a", "refresh": "r"})
+        m.get("/auth/me/").respond(403, json={"detail": "nope"})
+
+        async def receive():
+            return {"type": "http.request", "body": b"session_id=sess_csp&username=u&password=p"}
+
+        resp = await handler(Request(_post_scope(), receive=receive))
+        assert resp.status_code == 200
+        assert "(HTTP 403)" in resp.body.decode()
+        assert tmp_store.get_auth_session("sess_csp") is not None
+
+    with respx.mock(base_url=dummy_settings.api_base_url) as m:
+        m.post("/auth/login/").respond(200, json={"access": "a", "refresh": "r"})
+        m.get("/auth/me/").respond(200, json={"user": {"id": "1", "username": "u", "role": "PRE"}})
+
+        async def receive2():
+            return {"type": "http.request", "body": b"session_id=sess_csp&username=u&password=p"}
+
+        resp = await handler(Request(_post_scope(), receive=receive2))
+        assert resp.status_code == 302
+        assert "form-action" not in resp.headers.get("content-security-policy", "")
+
+
 @pytest.mark.asyncio
 async def test_oauth_store_auth_method_persistence(tmp_store):
     """Verify that token_endpoint_auth_method is persisted and defaulted correctly."""

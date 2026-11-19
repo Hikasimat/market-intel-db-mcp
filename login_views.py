@@ -22,7 +22,9 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": (
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+        # NOTE: no form-action directive. Chrome applies form-action to the 302 redirect
+        # that follows the POST, which would block the OAuth callback to the client.
+        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
     ),
 }
 
@@ -186,7 +188,7 @@ LOGIN_PAGE_HTML = """<!DOCTYPE html>
         <label for="password">Password</label>
         <input type="password" id="password" name="password" autocomplete="current-password" required>
       </div>
-      <button type="submit" class="submit-btn">Authorize Claude</button>
+      <button type="submit" class="submit-btn">Sign in &amp; Authorize</button>
     </form>
 
     <div class="footer">
@@ -280,6 +282,7 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                 async with httpx.AsyncClient(
                     timeout=settings.request_timeout_seconds,
                     follow_redirects=False,
+                    headers={"Accept": "application/json"},
                 ) as client:
                     # 1. Login
                     login_resp = await client.post(
@@ -290,8 +293,20 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                         return render_login(session_id, username, "Invalid username or password.")
 
                     data = login_resp.json()
-                    access_token = data.get("access") or data.get("access_token") or login_resp.cookies.get("access_token")
-                    refresh_token = data.get("refresh") or login_resp.cookies.get("refresh_token")
+                    access_token = None
+                    if isinstance(data, dict):
+                        for key in ("access", "access_token", "token"):
+                            val = data.get(key)
+                            if isinstance(val, str) and val:
+                                access_token = val
+                                break
+                    if not access_token:
+                        for name in ("access_token", "access"):
+                            val = login_resp.cookies.get(name) or client.cookies.get(name)
+                            if val:
+                                access_token = val
+                                break
+                    refresh_token = (data.get("refresh") if isinstance(data, dict) else None) or login_resp.cookies.get("refresh_token")
                     if not access_token:
                         return render_login(session_id, username, "Login succeeded but no access token was returned.")
 
@@ -301,7 +316,11 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                         headers={"Authorization": f"Bearer {access_token}"},
                     )
                     if me_resp.status_code != 200:
-                        return render_login(session_id, username, "Failed to verify account permissions.")
+                        log.warning("Market Intel /auth/me/ returned HTTP %d during OAuth login", me_resp.status_code)
+                        return render_login(
+                            session_id, username,
+                            f"Failed to verify account permissions (HTTP {me_resp.status_code}).",
+                        )
 
                     user_info = me_resp.json()
                     user = user_info.get("user", user_info) if isinstance(user_info, dict) else {}

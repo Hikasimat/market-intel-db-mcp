@@ -158,7 +158,7 @@ jobs:
           set_env_value MCP_OAUTH_DB_PATH /data/oauth.db
           set_env_value RESEARCH_CACHE_DB_PATH /data/research_cache.db
           if ! grep -q '^MCP_CORS_ALLOWED_ORIGINS=' "$TMP_ENV"; then
-            set_env_value MCP_CORS_ALLOWED_ORIGINS https://claude.ai
+            set_env_value MCP_CORS_ALLOWED_ORIGINS https://claude.ai,https://grok.com
           fi
 
           chmod 600 "$TMP_ENV"

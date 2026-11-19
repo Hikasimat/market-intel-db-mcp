@@ -35,7 +35,7 @@ class Settings:
     oauth_db_path: Path | None = None
     oauth_access_token_ttl_seconds: int = 3600
     oauth_refresh_token_ttl_seconds: int = 604800
-    cors_allowed_origins: tuple[str, ...] = ("https://claude.ai",)
+    cors_allowed_origins: tuple[str, ...] = ("https://claude.ai", "https://grok.com")
 
     # Research engine & cache
     research_cache_db_path: Path | None = None
@@ -125,7 +125,7 @@ def _bool(name: str, default: bool) -> bool:
 
 def _parse_cors_origins(raw: str | None) -> tuple[str, ...]:
     if raw is None or not raw.strip():
-        return ("https://claude.ai",)
+        return ("https://claude.ai", "https://grok.com")
     origins: list[str] = []
     for item in raw.split(","):
         origin = item.strip().rstrip("/")
