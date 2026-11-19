@@ -4,17 +4,27 @@ from __future__ import annotations
 import html
 import logging
 import secrets
-from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from config import Settings
+from config import LOCAL_HOSTS, Settings
 from mcp.server.auth.provider import construct_redirect_uri
 from oauth_store import OAuthStore
 
 log = logging.getLogger("prospect_mcp.login")
+
+SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+    ),
+}
 
 LOGIN_PAGE_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -210,6 +220,15 @@ EXPIRED_PAGE_HTML = """<!DOCTYPE html>
 """
 
 
+def _is_safe_redirect_uri(uri: str) -> bool:
+    parsed = urlparse((uri or "").strip())
+    if parsed.scheme == "https" and bool(parsed.hostname):
+        return True
+    if parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS:
+        return True
+    return False
+
+
 def render_login(session_id: str, username: str = "", error_message: str | None = None) -> HTMLResponse:
     error_block = f'<div class="alert">{html.escape(error_message)}</div>' if error_message else ""
     page = (
@@ -218,7 +237,11 @@ def render_login(session_id: str, username: str = "", error_message: str | None 
         .replace("{username}", html.escape(username))
         .replace("{error_block}", error_block)
     )
-    return HTMLResponse(page)
+    return HTMLResponse(page, headers=SECURITY_HEADERS)
+
+
+def _expired_response() -> HTMLResponse:
+    return HTMLResponse(EXPIRED_PAGE_HTML, status_code=400, headers=SECURITY_HEADERS)
 
 
 def create_login_handler(store: OAuthStore, settings: Settings):
@@ -226,10 +249,10 @@ def create_login_handler(store: OAuthStore, settings: Settings):
         if request.method == "GET":
             session_id = request.query_params.get("session_id", "").strip()
             if not session_id:
-                return HTMLResponse(EXPIRED_PAGE_HTML, status_code=400)
+                return _expired_response()
             session = store.get_auth_session(session_id)
             if not session:
-                return HTMLResponse(EXPIRED_PAGE_HTML, status_code=400)
+                return _expired_response()
             return render_login(session_id=session_id)
 
         if request.method == "POST":
@@ -239,18 +262,25 @@ def create_login_handler(store: OAuthStore, settings: Settings):
             password = str(form.get("password", ""))
 
             if not session_id:
-                return HTMLResponse(EXPIRED_PAGE_HTML, status_code=400)
+                return _expired_response()
 
             session = store.get_auth_session(session_id)
             if not session:
-                return HTMLResponse(EXPIRED_PAGE_HTML, status_code=400)
+                return _expired_response()
+
+            if not _is_safe_redirect_uri(session.redirect_uri):
+                store.delete_auth_session(session_id)
+                return HTMLResponse("Invalid OAuth redirect URI.", status_code=400, headers=SECURITY_HEADERS)
 
             if not username or not password:
                 return render_login(session_id, username, "Username and password are required.")
 
             # Authenticate against Market Intel Django API
             try:
-                async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+                async with httpx.AsyncClient(
+                    timeout=settings.request_timeout_seconds,
+                    follow_redirects=False,
+                ) as client:
                     # 1. Login
                     login_resp = await client.post(
                         f"{settings.api_base_url}/auth/login/",
@@ -265,7 +295,7 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                     if not access_token:
                         return render_login(session_id, username, "Login succeeded but no access token was returned.")
 
-                    # 2. Check /auth/me/ to verify authorized role
+                    # 2. Check /auth/me/ to verify strict PRE role
                     me_resp = await client.get(
                         f"{settings.api_base_url}/auth/me/",
                         headers={"Authorization": f"Bearer {access_token}"},
@@ -281,16 +311,11 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                     role = str(role or "").strip().upper()
                     is_superuser = bool(user.get("is_superuser"))
 
-                    allowed_roles = set(getattr(settings, "whatsapp_allowed_roles", ("PRE",)))
-                    role_permitted = (role in allowed_roles) or (is_superuser and "SUPERUSER" in allowed_roles)
-                    if not role_permitted:
-                        if allowed_roles == {"PRE"}:
-                            err_msg = f"Account role is '{role or 'Unknown'}'. Only accounts with the PRE role are permitted."
-                        else:
-                            err_msg = (
-                                f"Account role is '{role or 'Unknown'}'. "
-                                f"Only accounts with roles {', '.join(sorted(allowed_roles))} are permitted."
-                            )
+                    if role != "PRE":
+                        err_msg = (
+                            f"Account role is '{role or 'Unknown'}'. "
+                            "Only accounts with the PRE role are permitted."
+                        )
                         return render_login(session_id, username, err_msg)
 
                     user_id = str(user.get("id") or user.get("pk") or "")
@@ -298,8 +323,12 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                     subject = f"{user_id}:{canonical_username}"
 
             except Exception as exc:
-                log.exception("Error during OAuth login authentication")
-                return render_login(session_id, username, f"Could not connect to authentication service: {exc}")
+                log.warning("Error during OAuth login authentication: %s", type(exc).__name__)
+                return render_login(
+                    session_id,
+                    username,
+                    "Could not connect to authentication service. Please try again.",
+                )
 
             # Authentication succeeded! Mint authorization code
             code = f"mcp_code_{secrets.token_urlsafe(32)}"
@@ -313,17 +342,17 @@ def create_login_handler(store: OAuthStore, settings: Settings):
                 django_access_token=access_token,
                 django_refresh_token=refresh_token,
                 ttl_seconds=300,
-                role=role or ("SUPERUSER" if is_superuser else ""),
+                role="PRE",
                 is_superuser=is_superuser,
             )
 
             # Consume the auth session
             store.delete_auth_session(session_id)
 
-            # Redirect user back to Claude's redirect URI
+            # Redirect user back to client's redirect URI
             target_url = construct_redirect_uri(session.redirect_uri, code=code, state=session.state)
-            return RedirectResponse(url=target_url, status_code=302)
+            return RedirectResponse(url=target_url, status_code=302, headers=SECURITY_HEADERS)
 
-        return Response(status_code=405)
+        return Response(status_code=405, headers=SECURITY_HEADERS)
 
     return login_endpoint

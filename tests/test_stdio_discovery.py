@@ -9,9 +9,14 @@ from mcp.client.stdio import stdio_client
 SERVER = Path(__file__).resolve().parent.parent / "server.py"
 
 
-async def test_stdio_discovery_lists_all_tools():
-    env = {**os.environ, "MARKET_INTEL_API_BASE_URL": "https://example.invalid/api",
-           "MARKET_INTEL_USERNAME": "x", "MARKET_INTEL_PASSWORD": "y"}
+async def test_stdio_discovery_lists_all_tools(tmp_path):
+    env = {
+        **os.environ,
+        "MARKET_INTEL_API_BASE_URL": "https://example.invalid/api",
+        "MARKET_INTEL_USERNAME": "x",
+        "MARKET_INTEL_PASSWORD": "y",
+        "RESEARCH_CACHE_DB_PATH": str(tmp_path / "stdio_research.db"),
+    }
     params = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=env)
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -33,23 +38,8 @@ async def test_stdio_discovery_lists_all_tools():
                 "create_confirmed_record",
                 "validate_record_update",
                 "update_confirmed_record",
-                "connect_whatsapp",
-                "get_whatsapp_connection_status",
-                "get_whatsapp_qr_code",
-                "disconnect_whatsapp",
-                "list_whatsapp_chats",
-                "get_whatsapp_chat_history",
-                "get_whatsapp_contact_details",
-                "search_whatsapp_messages",
-                "send_whatsapp_message",
-                "send_whatsapp_media",
-                "mark_whatsapp_chat_read",
-                "sync_whatsapp_history",
-                "get_whatsapp_incoming_messages",
-                "edit_whatsapp_message",
-                "forward_whatsapp_message",
-                "create_whatsapp_group",
-                "manage_whatsapp_group_participants",
-                "get_whatsapp_group_invite_link",
-                "link_whatsapp_conversation_to_contact",
+                "research_company_prospect",
+                "research_market_event",
+                "get_research_cache_status",
+                "refresh_vortexen_profile",
             }

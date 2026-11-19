@@ -92,6 +92,17 @@ class ConfirmationStore:
             self._ops[self._slot(token)] = op
         return token, self._ttl
 
+    def peek_operation_meta(self, token: str, identity: str) -> tuple[str, str] | None:
+        """Thread-safely inspect (op_type, entity_type) only if token belongs to identity."""
+        if not isinstance(token, str) or not token.strip():
+            return None
+        slot = self._slot(token.strip())
+        with self._lock:
+            op = self._ops.get(slot)
+            if op is None or not hmac.compare_digest(op.identity, identity):
+                return None
+            return op.op_type, op.entity_type
+
     def consume(self, token: str, identity: str) -> StagedOperation:
         """Atomically claim a token for ONE operation attempt. It can never be claimed again."""
         if not isinstance(token, str) or not token.strip():
@@ -105,7 +116,7 @@ class ConfirmationStore:
             if self._clock() >= op.expires_at:
                 op.status = "CONSUMED"
                 raise ConfirmationError("Confirmation token expired. Run the validation tool again.")
-            if op.identity != identity:
+            if not hmac.compare_digest(op.identity, identity):
                 raise ConfirmationError("Token was issued for a different authenticated account.")
             expected_mac = self._mac(op.identity, op.op_type, op.entity_type, op.record_id, op.payload_json)
             if not hmac.compare_digest(op.mac, expected_mac):

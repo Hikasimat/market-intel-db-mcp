@@ -33,6 +33,9 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 # Copy the MCP server application.
 COPY . .
 
+# Persistent storage directory for SQLite OAuth & research caches.
+RUN mkdir -p /data
+
 # Streamable HTTP / SSE transport port.
 EXPOSE 8001
 

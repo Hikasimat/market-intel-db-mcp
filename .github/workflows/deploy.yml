@@ -151,11 +151,15 @@ jobs:
             fi
           }
 
-          # Force the intended OAuth configuration on every deployment.
+          # Force the intended OAuth, cache, and CORS configuration on every deployment.
           set_env_value MCP_OAUTH_ENABLED true
           set_env_value MCP_OAUTH_ISSUER_URL "$MCP_PUBLIC_ISSUER"
           set_env_value MCP_ISSUER_URL "$MCP_PUBLIC_ISSUER"
           set_env_value MCP_OAUTH_DB_PATH /data/oauth.db
+          set_env_value RESEARCH_CACHE_DB_PATH /data/research_cache.db
+          if ! grep -q '^MCP_CORS_ALLOWED_ORIGINS=' "$TMP_ENV"; then
+            set_env_value MCP_CORS_ALLOWED_ORIGINS https://claude.ai
+          fi
 
           chmod 600 "$TMP_ENV"
           mv "$TMP_ENV" "$APP_DIR/.env"

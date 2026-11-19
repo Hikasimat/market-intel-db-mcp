@@ -1,4 +1,4 @@
-"""Market Intel prospect-entry MCP server (stdio). Exactly three tools; nothing else.
+"""Market Intel prospect-entry & company research MCP server.
 
 IMPORTANT: stdout carries the MCP protocol. All logging goes to stderr.
 Run `python server.py --check` for an authentication/role health check.
@@ -6,6 +6,7 @@ Run `python server.py --check` for an authentication/role health check.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import sys
 from typing import Any, Awaitable, Callable
@@ -15,29 +16,33 @@ from mcp.server.mcpserver import MCPServer  # mcp 2.x (renamed from FastMCP in 1
 from api_client import AuthError, ApiError, Identity, MarketIntelClient
 from config import ConfigError, load_settings
 from confirmation_store import ConfirmationStore
-from whatsapp_workflow import EphemeralQRStore, SlidingWindowRateLimiter, StagedMediaStore, WhatsAppWorkflow
+from research.cache import SQLiteResearchCache
+from research.fetcher import SafeFetcher
+from research.provider_router import ProviderRouter
+from research.search import SearchClient
+from research.security import SecretRedactingFilter
+from research.service import ResearchService
+from research.vortexen_profile import VortexenProfileManager
 from workflow import Workflow
 
-INSTRUCTIONS = """Restricted Market Intel MCP server supporting four data/integration modules:
+INSTRUCTIONS = """Restricted Market Intel MCP server supporting three data modules and an evidence-based Research Engine:
 1. Government Entities
 2. Market Events
 3. Prospects
-4. WhatsApp Messaging & Session Integration
+4. Read-Only Company & Event Research Engine (aligned with our dynamic Vortexen business profile)
 
-Mandatory operating rules for Claude:
-1. Inspect the blueprint before researching a new prospect (call get_prospect_blueprint).
-2. Research every applicable blueprint field systematically, not just company name and website.
-3. Never invent facts, IDs, lookups, phone numbers, emails, or verification results.
-4. Always search existing records before attempting to create Government Entities or Market Events.
-5. Missing prerequisite lookup records (Government Entities, Market Events, Parent Companies) must be created and verified before creating the prospect.
-6. Every write must be validated and explicitly approved by the user (show full preview/diff and confirmation token).
-7. Edits require a before-and-after review and explicit user approval.
-8. Delete operations are strictly PROHIBITED for all modules.
-9. Research sources and unresolved fields must be disclosed to the user.
-10. No record or WhatsApp message may be reported as created, updated, or sent without verified API confirmation.
-11. WhatsApp operations are strictly scoped to the authenticated Market Intel user's own connected session and conversations.
-12. Outbound WhatsApp messages, media sends, edits, forwards, group changes, and session disconnects require explicit user approval via confirmation_token and user_has_explicitly_confirmed=true.
-13. Before replying to incoming WhatsApp messages or starting a new WhatsApp chat, call get_whatsapp_incoming_messages / get_whatsapp_chat_history / get_whatsapp_contact_details to sync live messages into Market Intel DB, match the sender/number against CRM records, and read conversation history."""
+Mandatory operating workflow for AI assistants:
+1. Inspect the authoritative blueprint first (call get_prospect_blueprint).
+2. Research the company via research_company_prospect (or event + participants via research_market_event).
+3. Resolve company identity and check existing prospects via search_existing_prospects for duplicates.
+4. Prioritize Market Offerings (Products, Services, Solutions) and Primary Industries from official evidence.
+5. Verify source evidence, corporate structure, shareholding/ownership (never confuse directors with shareholders or fabricate percentages), and key contacts (name, designation, and VALID official email required).
+6. Resolve real lookup UUIDs (parent companies, government entities, market events); never invent IDs or missing values.
+7. Review Vortexen service alignment derived from the live Vortexen website profile.
+8. Present structured candidate, evidence, conflicts, and missing fields to the user.
+9. Run validate_prospect_data (or module validator) — validation NEVER writes to Market Intel DB.
+10. Obtain explicit user approval after showing validation summary/diff, then call create_confirmed_prospect (or confirmed create/update tool) with confirmation_token and user_has_explicitly_confirmed=true.
+11. Delete operations are strictly PROHIBITED for all modules. Research tools are strictly read-only."""
 
 PROSPECT_FIELDS_HELP = """
 Blueprint Sections:
@@ -55,7 +60,8 @@ def create_mcp(
     get_workflow: Callable[[], Workflow | Awaitable[Workflow]],
     auth_settings: Any = None,
     auth_server_provider: Any = None,
-    get_whatsapp_workflow: Callable[[], WhatsAppWorkflow | Awaitable[WhatsAppWorkflow]] | None = None,
+    get_research_service: Callable[[], ResearchService | Awaitable[ResearchService]] | None = None,
+    shared_research_components: dict[str, Any] | None = None,
 ) -> MCPServer:
     mcp = MCPServer(
         "market-intel-prospect-entry",
@@ -64,8 +70,7 @@ def create_mcp(
         auth_server_provider=auth_server_provider,
     )
 
-    fallback_rate_limiter: SlidingWindowRateLimiter | None = None
-    fallback_media_store: StagedMediaStore | None = None
+    lazy_components: dict[str, Any] = dict(shared_research_components or {})
 
     async def _resolve_wf() -> Workflow:
         wf = get_workflow()
@@ -73,34 +78,48 @@ def create_mcp(
             return await wf
         return wf
 
-    async def _resolve_wa_wf() -> WhatsAppWorkflow:
-        nonlocal fallback_rate_limiter, fallback_media_store
-        if get_whatsapp_workflow is not None:
-            wa = get_whatsapp_workflow()
-            if asyncio.iscoroutine(wa):
-                return await wa
-            return wa
-        wf = await _resolve_wf()
-        if fallback_rate_limiter is None:
-            fallback_rate_limiter = SlidingWindowRateLimiter(wf.settings.whatsapp_rate_limit_per_minute)
-        if fallback_media_store is None:
-            fallback_media_store = StagedMediaStore(wf.settings.confirmation_ttl_seconds)
-        wa = WhatsAppWorkflow(
-            wf.client,
-            wf.store,
-            wf.settings,
-            rate_limiter=fallback_rate_limiter,
-            media_store=fallback_media_store,
-        )
-        setattr(wa, "_ephemeral_client", getattr(wf, "_ephemeral_client", False))
-        return wa
-
     async def _close_if_ephemeral(holder: Any) -> None:
-        if getattr(holder, "_ephemeral_client", False) and hasattr(holder.client, "aclose"):
+        if getattr(holder, "_ephemeral_client", False) and hasattr(holder, "client") and hasattr(holder.client, "aclose"):
             try:
                 await holder.client.aclose()
             except Exception:
                 pass
+
+    async def _resolve_research() -> tuple[ResearchService, bool]:
+        if get_research_service is not None:
+            rs = get_research_service()
+            if asyncio.iscoroutine(rs):
+                rs = await rs
+            return rs, bool(getattr(rs, "_ephemeral_client", False))
+
+        wf = await _resolve_wf()
+        if "cache" not in lazy_components:
+            cache = SQLiteResearchCache(wf.settings.research_cache_db_path or "research_cache.db")
+            fetcher = SafeFetcher(wf.settings, cache=cache)
+            search_client = SearchClient(wf.settings)
+            router = ProviderRouter(wf.settings, cache=cache)
+            vortexen = VortexenProfileManager(wf.settings, fetcher, cache=cache, router=router)
+            lazy_components.update({
+                "cache": cache,
+                "fetcher": fetcher,
+                "search_client": search_client,
+                "router": router,
+                "vortexen": vortexen,
+            })
+
+        rs = ResearchService(
+            wf.client,
+            wf,
+            wf.settings,
+            cache=lazy_components["cache"],
+            fetcher=lazy_components["fetcher"],
+            search_client=lazy_components["search_client"],
+            router=lazy_components["router"],
+            vortexen_manager=lazy_components["vortexen"],
+        )
+        ephemeral = getattr(wf, "_ephemeral_client", False)
+        setattr(rs, "_ephemeral_client", ephemeral)
+        return rs, ephemeral
 
     # --- Blueprint Discovery ---
     @mcp.tool()
@@ -110,7 +129,10 @@ def create_mcp(
         allowed choices, numeric limits, conditional rules, lookup dependencies, and validation rules across all
         7 business sections (Corporate Structure, General Info, Shareholding, Offerings, Events, Contacts, Gov Entity)."""
         wf = await _resolve_wf()
-        return wf.get_prospect_blueprint()
+        try:
+            return wf.get_prospect_blueprint()
+        finally:
+            await _close_if_ephemeral(wf)
 
     # --- Search Tools ---
     @mcp.tool()
@@ -119,7 +141,10 @@ def create_mcp(
         Use it to spot possible duplicates and find real parent-company IDs for hierarchy linking.
         Results are limited to what this account can see; backend duplicate checks decide at creation."""
         wf = await _resolve_wf()
-        return await wf.search(query, country, limit)
+        try:
+            return await wf.search(query, country, limit)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def search_government_entities(
@@ -128,7 +153,10 @@ def create_mcp(
         """READ-ONLY. Search existing government entities by name or country.
         Use it to verify if a government entity already exists before creating a new one or linking to prospects."""
         wf = await _resolve_wf()
-        return await wf.search_government_entities(query, country, is_state_government, limit)
+        try:
+            return await wf.search_government_entities(query, country, is_state_government, limit)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def search_market_events(
@@ -137,14 +165,20 @@ def create_mcp(
         """READ-ONLY. Search existing market events (conferences, expos, trade summits) by event title or country.
         Use it to find real event IDs for linking to prospects via market_event_ids."""
         wf = await _resolve_wf()
-        return await wf.search_market_events(query, host_country, limit)
+        try:
+            return await wf.search_market_events(query, host_country, limit)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def get_record_details(entity_type: str, record_id: str) -> dict[str, Any]:
         """READ-ONLY. Retrieve complete details of a specific record by module and UUID.
         Supported entity_types: 'prospect', 'government_entity', 'market_event'."""
         wf = await _resolve_wf()
-        return await wf.get_record_details(entity_type, record_id)
+        try:
+            return await wf.get_record_details(entity_type, record_id)
+        finally:
+            await _close_if_ephemeral(wf)
 
     # --- Government Entity Staged Creation ---
     @mcp.tool(description=(
@@ -153,14 +187,20 @@ def create_mcp(
         "phone_number, complete_address. Checks duplicates. On success returns summary and a confirmation_token."))
     async def validate_government_entity(entity: dict[str, Any]) -> dict[str, Any]:
         wf = await _resolve_wf()
-        return await wf.validate_government_entity(entity)
+        try:
+            return await wf.validate_government_entity(entity)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def create_confirmed_government_entity(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
         """Create exactly ONE Government Entity from a previously validated payload.
         Call ONLY after explicit user approval. Returns the created record and its database UUID."""
         wf = await _resolve_wf()
-        return await wf.create_government_entity(confirmation_token, user_has_explicitly_confirmed)
+        try:
+            return await wf.create_government_entity(confirmation_token, user_has_explicitly_confirmed)
+        finally:
+            await _close_if_ephemeral(wf)
 
     # --- Market Event Staged Creation ---
     @mcp.tool(description=(
@@ -168,14 +208,20 @@ def create_mcp(
         "Optional: start_date, end_date, website_url. Checks duplicates. On success returns summary and a confirmation_token."))
     async def validate_market_event(event: dict[str, Any]) -> dict[str, Any]:
         wf = await _resolve_wf()
-        return await wf.validate_market_event(event)
+        try:
+            return await wf.validate_market_event(event)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def create_confirmed_market_event(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
         """Create exactly ONE Market Event from a previously validated payload.
         Call ONLY after explicit user approval. Returns the created record and its database UUID."""
         wf = await _resolve_wf()
-        return await wf.create_market_event(confirmation_token, user_has_explicitly_confirmed)
+        try:
+            return await wf.create_market_event(confirmation_token, user_has_explicitly_confirmed)
+        finally:
+            await _close_if_ephemeral(wf)
 
     # --- Prospect Staged Creation ---
     @mcp.tool(description=(
@@ -186,7 +232,10 @@ def create_mcp(
         "summary and a one-time confirmation_token; show summary to the user and obtain explicit approval." + PROSPECT_FIELDS_HELP))
     async def validate_prospect_data(prospect: dict[str, Any]) -> dict[str, Any]:
         wf = await _resolve_wf()
-        return await wf.validate(prospect)
+        try:
+            return await wf.validate(prospect)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def create_confirmed_prospect(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
@@ -195,7 +244,10 @@ def create_mcp(
         Takes no new data: the reviewed payload is bound to the token (single-use, expires). Emails are re-verified
         and duplicates re-checked first. On a timeout the outcome is UNCERTAIN: do NOT retry; search first."""
         wf = await _resolve_wf()
-        return await wf.create(confirmation_token, user_has_explicitly_confirmed)
+        try:
+            return await wf.create(confirmation_token, user_has_explicitly_confirmed)
+        finally:
+            await _close_if_ephemeral(wf)
 
     # --- Generic & Edit Workflows ---
     @mcp.tool(description=(
@@ -205,458 +257,137 @@ def create_mcp(
         "Does NOT write to the database."))
     async def validate_record_update(entity_type: str, record_id: str, changes: dict[str, Any]) -> dict[str, Any]:
         wf = await _resolve_wf()
-        return await wf.validate_record_update(entity_type, record_id, changes)
+        try:
+            return await wf.validate_record_update(entity_type, record_id, changes)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool()
     async def update_confirmed_record(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
         """Apply an approved update to an existing record. Call ONLY after the user has seen the before-and-after diff "
         "and explicitly confirmed approval. Verifies the record has not been concurrently modified before applying update."""
         wf = await _resolve_wf()
-        return await wf.update_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
+        try:
+            return await wf.update_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool(description="Generic validation dispatcher for any of the three modules ('prospect', 'government_entity', 'market_event').")
     async def validate_record_creation(entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
         wf = await _resolve_wf()
-        return await wf.validate_record_creation(entity_type, data)
+        try:
+            return await wf.validate_record_creation(entity_type, data)
+        finally:
+            await _close_if_ephemeral(wf)
 
     @mcp.tool(description="Generic commitment dispatcher for any confirmed creation or update token.")
     async def create_confirmed_record(confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
         wf = await _resolve_wf()
-        return await wf.create_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
-
-    # --- WhatsApp Connection Tools ---
-    @mcp.tool(description=(
-        "Initiate or resume the authenticated Market Intel user's WhatsApp session. "
-        "Returns connection status and phone number when connected, or a scannable QR link (`qr_url`) / QR data "
-        "when scanning is required. When `qr_url` is returned, give that clickable link directly to the user so they can scan it. "
-        "Set wait_for_connection=true (and optional timeout_seconds, max 60) to poll until connected."
-    ))
-    async def connect_whatsapp(
-        wait_for_connection: bool = False,
-        timeout_seconds: int = 30,
-        force_restart: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
         try:
-            return await wa.connect_whatsapp(
-                wait_for_connection=wait_for_connection,
-                timeout_seconds=timeout_seconds,
-                force_restart=force_restart,
+            return await wf.create_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
+        finally:
+            await _close_if_ephemeral(wf)
+
+    # --- Read-Only Company & Event Research Tools ---
+    @mcp.tool(description=(
+        "READ-ONLY. Conduct comprehensive, evidence-backed six-section company research prioritized around "
+        "Primary Industries and Market Offerings, Corporate Structure & parent auto-linking, Shareholding/Ownership, "
+        "Market Events, and strictly verified Key Contacts. Checks Market Intel duplicates, aligns against the live "
+        "Vortexen profile, and tracks field-level sources, conflicts, and token usage. Never creates or updates records."
+    ))
+    async def research_company_prospect(
+        company_name: str,
+        country: str | None = None,
+        official_website: str | None = None,
+        sections: list[str] | None = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        rs, ephemeral = await _resolve_research()
+        try:
+            return await rs.research_company(
+                company_name,
+                country=country,
+                official_website=official_website,
+                sections=sections,
+                force_refresh=force_refresh,
             )
         finally:
-            await _close_if_ephemeral(wa)
+            if ephemeral and hasattr(rs.client, "aclose"):
+                await rs.client.aclose()
 
     @mcp.tool(description=(
-        "READ-ONLY. Check the authenticated user's WhatsApp session connection status, "
-        "bound WhatsApp phone number, identity verification state, and outbound safety configuration."
+        "READ-ONLY. Research a market event (expo, conference, summit), verify event details from official sources, "
+        "discover and deduplicate exhibitors/sponsors/speakers, and run full 6-section company research with Vortexen "
+        "alignment up to max_participants. Never creates or updates database records."
     ))
-    async def get_whatsapp_connection_status() -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.get_whatsapp_connection_status()
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Retrieve the live WhatsApp QR code for the authenticated user's session if authentication is needed, "
-        "or report connected status if already authenticated. When `qr_url` is returned, give that clickable link "
-        "directly to the user instead of raw base64 image data. Set force_restart=true to regenerate the QR code."
-    ))
-    async def get_whatsapp_qr_code(force_restart: bool = False) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.get_whatsapp_qr_code(force_restart=force_restart)
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Disconnect (logout) the authenticated user's WhatsApp session while preserving all persisted "
-        "conversations and message history in Market Intel DB. Requires explicit user confirmation via "
-        "confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def disconnect_whatsapp(
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
+    async def research_market_event(
+        event_name: str,
+        country: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        event_website: str | None = None,
+        max_participants: int = 10,
+        research_companies: bool = True,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
+        rs, ephemeral = await _resolve_research()
         try:
-            return await wa.disconnect_whatsapp(
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
+            return await rs.research_event(
+                event_name,
+                country=country,
+                start_date=start_date,
+                end_date=end_date,
+                event_website=event_website,
+                max_participants=max_participants,
+                research_companies=research_companies,
+                force_refresh=force_refresh,
             )
         finally:
-            await _close_if_ephemeral(wa)
-
-    # --- WhatsApp Conversation Tools ---
-    @mcp.tool(description=(
-        "READ-ONLY. List WhatsApp chats owned by the authenticated user's connected session. "
-        "Syncs recent WAHA messages into Market Intel DB by default (sync=true) and supports search, is_group, "
-        "matched_only, limit (1-100), and cursor pagination."
-    ))
-    async def list_whatsapp_chats(
-        search: str | None = None,
-        is_group: bool | None = None,
-        matched_only: bool = False,
-        limit: int = 25,
-        cursor: str | None = None,
-        sync: bool = True,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.list_whatsapp_chats(
-                search=search,
-                is_group=is_group,
-                matched_only=matched_only,
-                limit=limit,
-                cursor=cursor,
-                sync=sync,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
+            if ephemeral and hasattr(rs.client, "aclose"):
+                await rs.client.aclose()
 
     @mcp.tool(description=(
-        "READ-ONLY. Sync and retrieve incoming WhatsApp messages, matched Market Intel DB contact/prospect details, "
-        "and recent conversation history (by phone_number, chat_id, sender_id, or conversation_id; or leave blank for all recent chats). "
-        "Auto-links matched Market Intel contacts to conversations and provides reply_hint with reply_to for contextual replies."
+        "READ-ONLY. Inspect persistent research cache availability, field freshness, Vortexen profile status, "
+        "enabled AI/search providers, and cumulative token/cost usage metrics."
     ))
-    async def get_whatsapp_incoming_messages(
-        phone_number: str | None = None,
-        chat_id: str | None = None,
-        sender_id: str | None = None,
-        conversation_id: str | None = None,
-        unread_only: bool = False,
-        history_limit: int = 20,
-        sync: bool = True,
+    async def get_research_cache_status(
+        company_name: str | None = None,
+        country: str | None = None,
     ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
+        rs, ephemeral = await _resolve_research()
         try:
-            return await wa.get_whatsapp_incoming_messages(
-                phone_number=phone_number,
-                chat_id=chat_id,
-                sender_id=sender_id,
-                conversation_id=conversation_id,
-                unread_only=unread_only,
-                history_limit=history_limit,
-                sync=sync,
-            )
+            return await rs.get_cache_status(company_name=company_name, country=country)
         finally:
-            await _close_if_ephemeral(wa)
+            if ephemeral and hasattr(rs.client, "aclose"):
+                await rs.client.aclose()
 
     @mcp.tool(description=(
-        "Synchronize recent WhatsApp messages (from WAHA into Market Intel DB) for the authenticated user's session "
-        "or a specific conversation/chat_id."
+        "READ-ONLY (to Market Intel DB). Crawl https://vortexen.com/ safely and refresh the cached versioned "
+        "Vortexen business profile used for prospect qualification. Does NOT modify any Market Intel records."
     ))
-    async def sync_whatsapp_history(
-        days: int = 2,
-        chat_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
+    async def refresh_vortexen_profile(force: bool = True) -> dict[str, Any]:
+        rs, ephemeral = await _resolve_research()
         try:
-            return await wa.sync_whatsapp_history(
-                days=days,
-                chat_id=chat_id,
-                conversation_id=conversation_id,
-            )
+            return await rs.refresh_vortexen_profile(force=force)
         finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "READ-ONLY. Retrieve persisted conversation message history from Market Intel DB (syncing new WAHA messages "
-        "first by default) for one of the authenticated user's owned chats (by conversation_id, chat_id, or phone_number). "
-        "Includes latest_message, latest_inbound_message, crm_match, direction, timestamps, media metadata, reply_context, and pagination."
-    ))
-    async def get_whatsapp_chat_history(
-        conversation_id: str | None = None,
-        chat_id: str | None = None,
-        phone_number: str | None = None,
-        page_size: int = 50,
-        cursor: str | None = None,
-        order: str = "asc",
-        sync: bool = True,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.get_whatsapp_chat_history(
-                conversation_id=conversation_id,
-                chat_id=chat_id,
-                phone_number=phone_number,
-                page_size=page_size,
-                cursor=cursor,
-                order=order,
-                sync=sync,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "READ-ONLY. Retrieve contact details, CRM Prospect/Key Person linkage, and group members "
-        "for an owned WhatsApp chat (by chat_id, phone_number, or conversation_id)."
-    ))
-    async def get_whatsapp_contact_details(
-        chat_id: str | None = None,
-        phone_number: str | None = None,
-        conversation_id: str | None = None,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.get_whatsapp_contact_details(
-                chat_id=chat_id,
-                phone_number=phone_number,
-                conversation_id=conversation_id,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "READ-ONLY. Search persisted WhatsApp messages strictly within the authenticated user's owned conversations. "
-        "Supports optional conversation_id/chat_id scope, direction ('INBOUND'/'OUTBOUND'), has_media filter, sync, limit, and cursor."
-    ))
-    async def search_whatsapp_messages(
-        query: str,
-        conversation_id: str | None = None,
-        chat_id: str | None = None,
-        direction: str | None = None,
-        has_media: bool | None = None,
-        limit: int = 25,
-        cursor: str | None = None,
-        sync: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.search_whatsapp_messages(
-                query=query,
-                conversation_id=conversation_id,
-                chat_id=chat_id,
-                direction=direction,
-                has_media=has_media,
-                limit=limit,
-                cursor=cursor,
-                sync=sync,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    # --- WhatsApp Messaging Tools ---
-    @mcp.tool(description=(
-        "Send or reply to a WhatsApp text message through the authenticated user's connected Market Intel session. "
-        "Matches new numbers against Market Intel DB and maintains conversation history in DB. "
-        "Pass reply_to (waha_message_id or DB message UUID) to quote/reply to a specific message, and optional mentions list. "
-        "Call first without confirmation_token to preview recipient/CRM match + confirmation_token; "
-        "after explicit user approval, call again with confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def send_whatsapp_message(
-        recipient: str | None = None,
-        message_body: str = "",
-        chat_id: str | None = None,
-        prospect_contact_id: str | None = None,
-        reply_to: str | None = None,
-        mentions: list[str] | None = None,
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.send_whatsapp_message(
-                recipient=recipient,
-                message_body=message_body,
-                chat_id=chat_id,
-                prospect_contact_id=prospect_contact_id,
-                reply_to=reply_to,
-                mentions=mentions,
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Send a media attachment (image, document, audio, video as base64) via the authenticated user's connected WhatsApp session. "
-        "Call first with file details to validate and obtain a preview + confirmation_token; "
-        "after explicit user approval, call again with confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def send_whatsapp_media(
-        recipient: str | None = None,
-        chat_id: str | None = None,
-        filename: str = "",
-        mime_type: str = "",
-        file_base64: str = "",
-        caption: str = "",
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.send_whatsapp_media(
-                recipient=recipient,
-                chat_id=chat_id,
-                filename=filename,
-                mime_type=mime_type,
-                file_base64=file_base64,
-                caption=caption,
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Mark all inbound messages in an owned WhatsApp conversation as read in Market Intel DB and WAHA."
-    ))
-    async def mark_whatsapp_chat_read(
-        conversation_id: str | None = None,
-        chat_id: str | None = None,
-        phone_number: str | None = None,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.mark_whatsapp_chat_read(
-                conversation_id=conversation_id,
-                chat_id=chat_id,
-                phone_number=phone_number,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Edit a previously sent outbound WhatsApp message (updates both WhatsApp/WAHA and Market Intel DB). "
-        "Call first without confirmation_token to preview before/after text; after explicit user approval, "
-        "call again with confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def edit_whatsapp_message(
-        message_id: str,
-        new_text: str,
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.edit_whatsapp_message(
-                message_id=message_id,
-                new_text=new_text,
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Forward an existing WhatsApp text or media message from an owned chat to another WhatsApp recipient, "
-        "matching target numbers against Market Intel DB and storing the forwarded message in DB. "
-        "Requires explicit confirmation via confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def forward_whatsapp_message(
-        source_message_id: str,
-        source_conversation_id: str | None = None,
-        recipient: str | None = None,
-        chat_id: str | None = None,
-        prospect_contact_id: str | None = None,
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.forward_whatsapp_message(
-                source_message_id=source_message_id,
-                source_conversation_id=source_conversation_id,
-                recipient=recipient,
-                chat_id=chat_id,
-                prospect_contact_id=prospect_contact_id,
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Create a new WhatsApp group chat with the specified group_name and participant phone numbers, "
-        "storing the group conversation in Market Intel DB. Requires explicit confirmation via "
-        "confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def create_whatsapp_group(
-        group_name: str,
-        participants: list[str],
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.create_whatsapp_group(
-                group_name=group_name,
-                participants=participants,
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Add or remove participants (`action`: 'add' or 'remove') on an owned WhatsApp group chat. "
-        "Requires explicit confirmation via confirmation_token and user_has_explicitly_confirmed=true."
-    ))
-    async def manage_whatsapp_group_participants(
-        group_chat_id: str,
-        action: str,
-        participants: list[str],
-        confirmation_token: str | None = None,
-        user_has_explicitly_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.manage_whatsapp_group_participants(
-                group_chat_id=group_chat_id,
-                action=action,
-                participants=participants,
-                confirmation_token=confirmation_token,
-                user_has_explicitly_confirmed=user_has_explicitly_confirmed,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "READ-ONLY. Retrieve or generate the WhatsApp invite link for an owned WhatsApp group."
-    ))
-    async def get_whatsapp_group_invite_link(
-        group_chat_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.get_whatsapp_group_invite_link(
-                group_chat_id=group_chat_id,
-                conversation_id=conversation_id,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
-
-    @mcp.tool(description=(
-        "Associate an owned WhatsApp conversation in Market Intel DB with a matching ProspectContact (Key Person), "
-        "using explicit prospect_contact_id or automatic phone-number matching."
-    ))
-    async def link_whatsapp_conversation_to_contact(
-        conversation_id: str | None = None,
-        chat_id: str | None = None,
-        phone_number: str | None = None,
-        prospect_contact_id: str | None = None,
-    ) -> dict[str, Any]:
-        wa = await _resolve_wa_wf()
-        try:
-            return await wa.link_whatsapp_conversation_to_contact(
-                conversation_id=conversation_id,
-                chat_id=chat_id,
-                phone_number=phone_number,
-                prospect_contact_id=prospect_contact_id,
-            )
-        finally:
-            await _close_if_ephemeral(wa)
+            if ephemeral and hasattr(rs.client, "aclose"):
+                await rs.client.aclose()
 
     return mcp
 
 
 def _build_workflow() -> tuple[Workflow, MarketIntelClient]:
     settings = load_settings()
-    logging.basicConfig(level=getattr(logging, settings.log_level, logging.INFO), stream=sys.stderr,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level, logging.INFO),
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    redactor = SecretRedactingFilter(settings.secret_values)
+    root_logger = logging.getLogger()
+    root_logger.addFilter(redactor)
+    for handler in root_logger.handlers:
+        handler.addFilter(redactor)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs full URLs; keep quiet
     client = MarketIntelClient(settings)
     return Workflow(client, ConfirmationStore(settings.confirmation_ttl_seconds), settings), client
@@ -676,45 +407,36 @@ async def _health_check() -> int:
 
 
 class TokenAuthMiddleware:
-    """ASGI middleware to enforce token authentication on HTTP/SSE endpoints.
+    """ASGI middleware to enforce constant-time Bearer token authentication on HTTP/SSE endpoints."""
 
-    Accepts token via:
-      1. Query parameter: ?token=<secret> (ideal for Claude.ai custom connectors)
-      2. Authorization header: Bearer <secret>
-    """
-    def __init__(self, app, secret_token: str):
+    def __init__(self, app, secret_token: str, allow_query_token: bool = False):
         self.app = app
         self.secret_token = secret_token
+        self.allow_query_token = allow_query_token
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            path = scope.get("path", "")
-            method = scope.get("method", "GET")
-            if method in ("GET", "HEAD") and path.startswith("/whatsapp/qr/"):
-                await self.app(scope, receive, send)
-                return
-
             from urllib.parse import parse_qs
             from starlette.responses import JSONResponse
 
-            # Check query params: ?token=...
-            query_string = scope.get("query_string", b"").decode("utf-8")
-            params = parse_qs(query_string)
-            token = params.get("token", [None])[0]
+            token: str | None = None
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"authorization":
+                    header_val = value.decode("utf-8", errors="replace")
+                    if header_val.startswith("Bearer "):
+                        token = header_val[7:].strip()
+                    break
 
-            # Check Authorization: Bearer ... header
-            if not token:
-                for name, value in scope.get("headers", []):
-                    if name.lower() == b"authorization":
-                        header_val = value.decode("utf-8")
-                        if header_val.startswith("Bearer "):
-                            token = header_val[7:].strip()
-                        break
+            if not token and self.allow_query_token:
+                query_string = scope.get("query_string", b"").decode("utf-8", errors="replace")
+                params = parse_qs(query_string)
+                token = params.get("token", [None])[0]
 
-            if token != self.secret_token:
+            if not token or not hmac.compare_digest(token.encode("utf-8"), self.secret_token.encode("utf-8")):
                 response = JSONResponse(
-                    {"error": "Unauthorized: valid token required (?token=<secret> or Bearer auth)"},
+                    {"error": "Unauthorized: valid Bearer token required in Authorization header."},
                     status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
                 )
                 await response(scope, receive, send)
                 return
@@ -725,10 +447,10 @@ class TokenAuthMiddleware:
 class DefaultPublicClientAuthMethodMiddleware:
     """ASGI middleware for dynamic client registration (/register).
 
-    If an OAuth client (like Claude's automatic client registration) omits
-    `token_endpoint_auth_method`, default it to 'none' so that public clients
-    can exchange authorization codes using PKCE S256 without needing a client secret.
+    If an OAuth client omits `token_endpoint_auth_method`, default it to 'none'
+    so public clients can exchange authorization codes using PKCE S256 without a client secret.
     """
+
     def __init__(self, app: Any):
         self.app = app
 
@@ -764,6 +486,39 @@ class DefaultPublicClientAuthMethodMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+
+def validate_remote_transport_auth(transport: str, enable_oauth: bool, auth_token: str | None) -> None:
+    """Refuse to start remote HTTP/SSE transports without OAuth or Bearer token auth."""
+    if transport in ("sse", "streamable-http") and not enable_oauth and not auth_token:
+        raise ConfigError(
+            "Remote HTTP/SSE transport requires authentication. Enable OAuth (MCP_OAUTH_ENABLED=true) "
+            "or configure MCP_AUTH_TOKEN before starting the server."
+        )
+
+
+def configure_cors(app: Any, allowed_origins: tuple[str, ...]) -> None:
+    """Attach explicit CORS allowlist middleware (never wildcard with credentials)."""
+    from starlette.middleware.cors import CORSMiddleware
+
+    if not allowed_origins or "*" in allowed_origins:
+        raise ConfigError("CORS configuration with wildcard '*' and credentials is not permitted.")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(allowed_origins),
+        allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Accept",
+            "mcp-protocol-version",
+            "mcp-session-id",
+            "last-event-id",
+        ],
+        allow_credentials=True,
+        expose_headers=["mcp-session-id", "mcp-protocol-version"],
+    )
 
 
 def configure_oauth_endpoints(app: Any, issuer_url: str) -> None:
@@ -836,7 +591,7 @@ def configure_oauth_endpoints(app: Any, issuer_url: str) -> None:
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Market Intel prospect-entry MCP server")
+    parser = argparse.ArgumentParser(description="Market Intel prospect-entry & research MCP server")
     parser.add_argument("--check", action="store_true", help="Run pre-flight auth & role health check and exit")
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio",
                         help="MCP transport protocol (default: stdio)")
@@ -845,7 +600,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind on (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8001, help="Port to listen on (default: 8001)")
     parser.add_argument("--auth-token", default=None,
-                        help="Secret token required to access SSE/HTTP endpoints (or set MCP_AUTH_TOKEN in .env)")
+                        help="Secret Bearer token required to access SSE/HTTP endpoints (or set MCP_AUTH_TOKEN in .env)")
     parser.add_argument("--oauth", action="store_true", default=None,
                         help="Enable OAuth 2.0 Sign In flow (or set MCP_OAUTH_ENABLED=true in .env)")
     parser.add_argument("--issuer-url", default=None,
@@ -865,6 +620,13 @@ def main() -> None:
 
     enable_oauth = args.oauth if args.oauth is not None else workflow.settings.oauth_enabled
     issuer_url = args.issuer_url or workflow.settings.oauth_issuer_url
+    auth_token = args.auth_token or workflow.settings.auth_token
+
+    try:
+        validate_remote_transport_auth(args.transport, enable_oauth, auth_token)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     oauth_provider = None
     auth_settings = None
@@ -880,7 +642,12 @@ def main() -> None:
 
         db_path = args.db_path or workflow.settings.oauth_db_path
         oauth_store = OAuthStore(db_path)
-        oauth_provider = SQLiteOAuthProvider(oauth_store, issuer_url)
+        oauth_provider = SQLiteOAuthProvider(
+            oauth_store,
+            issuer_url,
+            access_token_ttl=workflow.settings.oauth_access_token_ttl_seconds,
+            refresh_token_ttl=workflow.settings.oauth_refresh_token_ttl_seconds,
+        )
         auth_settings = AuthSettings(
             issuer_url=issuer_url,
             resource_server_url=f"{issuer_url}/mcp",
@@ -889,23 +656,18 @@ def main() -> None:
         )
 
     shared_store = ConfirmationStore(workflow.settings.confirmation_ttl_seconds)
-    shared_rate_limiter = SlidingWindowRateLimiter(workflow.settings.whatsapp_rate_limit_per_minute)
-    shared_media_store = StagedMediaStore(workflow.settings.confirmation_ttl_seconds)
-    shared_qr_store = EphemeralQRStore()
-    qr_public_base_url = (
-        issuer_url.strip().rstrip("/")
-        if (args.transport in ("sse", "streamable-http") and issuer_url)
-        else None
-    )
-    default_wa_workflow = WhatsAppWorkflow(
-        workflow.client,
-        shared_store,
-        workflow.settings,
-        rate_limiter=shared_rate_limiter,
-        media_store=shared_media_store,
-        qr_store=shared_qr_store,
-        qr_public_base_url=qr_public_base_url,
-    )
+    research_cache = SQLiteResearchCache(workflow.settings.research_cache_db_path or "research_cache.db")
+    research_fetcher = SafeFetcher(workflow.settings, cache=research_cache)
+    research_search = SearchClient(workflow.settings)
+    research_router = ProviderRouter(workflow.settings, cache=research_cache)
+    vortexen_mgr = VortexenProfileManager(workflow.settings, research_fetcher, cache=research_cache, router=research_router)
+    shared_research_components = {
+        "cache": research_cache,
+        "fetcher": research_fetcher,
+        "search_client": research_search,
+        "router": research_router,
+        "vortexen": vortexen_mgr,
+    }
 
     def _build_oauth_client() -> MarketIntelClient | None:
         if oauth_store:
@@ -935,97 +697,87 @@ def main() -> None:
         return None
 
     async def get_active_workflow() -> Workflow:
-        user_client = _build_oauth_client()
-        if user_client is not None:
+        if enable_oauth and args.transport != "stdio":
+            user_client = _build_oauth_client()
+            if user_client is None:
+                raise AuthError("Valid authenticated OAuth session is required.")
             wf = Workflow(user_client, shared_store, workflow.settings)
             setattr(wf, "_ephemeral_client", True)
             return wf
         return workflow
 
-    async def get_active_whatsapp_workflow() -> WhatsAppWorkflow:
-        user_client = _build_oauth_client()
-        if user_client is not None:
-            wa = WhatsAppWorkflow(
-                user_client,
-                shared_store,
-                workflow.settings,
-                rate_limiter=shared_rate_limiter,
-                media_store=shared_media_store,
-                qr_store=shared_qr_store,
-                qr_public_base_url=qr_public_base_url,
-            )
-            setattr(wa, "_ephemeral_client", True)
-            return wa
-        return default_wa_workflow
+    async def get_active_research_service() -> ResearchService:
+        active_wf = await get_active_workflow()
+        rs = ResearchService(
+            active_wf.client,
+            active_wf,
+            workflow.settings,
+            cache=research_cache,
+            fetcher=research_fetcher,
+            search_client=research_search,
+            router=research_router,
+            vortexen_manager=vortexen_mgr,
+        )
+        setattr(rs, "_ephemeral_client", getattr(active_wf, "_ephemeral_client", False))
+        return rs
 
     mcp = create_mcp(
         get_active_workflow,
         auth_settings=auth_settings,
         auth_server_provider=oauth_provider,
-        get_whatsapp_workflow=get_active_whatsapp_workflow,
+        get_research_service=get_active_research_service,
+        shared_research_components=shared_research_components,
     )
 
     if enable_oauth and oauth_store:
         from login_views import create_login_handler
         mcp.custom_route("/login", methods=["GET", "POST"])(create_login_handler(oauth_store, workflow.settings))
 
-    if args.transport in ("sse", "streamable-http"):
-        from whatsapp_qr_views import create_qr_image_handler, create_qr_page_handler
-        mcp.custom_route("/whatsapp/qr/{token}", methods=["GET"])(create_qr_page_handler(shared_qr_store))
-        mcp.custom_route("/whatsapp/qr/{token}/image", methods=["GET"])(create_qr_image_handler(shared_qr_store))
-
-    auth_token = args.auth_token or workflow.settings.auth_token
-
     if args.transport == "stdio":
-        mcp.run(transport="stdio")
-    elif args.transport == "sse":
+        try:
+            mcp.run(transport="stdio")
+        finally:
+            async def _cleanup():
+                await research_fetcher.aclose()
+                await research_search.aclose()
+                await research_router.aclose()
+                await _client.aclose()
+            try:
+                asyncio.run(_cleanup())
+            except Exception:
+                pass
+    elif args.transport in ("sse", "streamable-http"):
         import uvicorn
-        from starlette.middleware.cors import CORSMiddleware
-        app = mcp.sse_app(host=args.host)
+
+        app = mcp.sse_app(host=args.host) if args.transport == "sse" else mcp.streamable_http_app(host=args.host)
         if enable_oauth:
             configure_oauth_endpoints(app, issuer_url)
             app.add_middleware(DefaultPublicClientAuthMethodMiddleware)
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            allow_credentials=True,
-            expose_headers=["*"],
-        )
+        configure_cors(app, workflow.settings.cors_allowed_origins)
         if enable_oauth:
             print(f"OAuth 2.0 Sign In ACTIVE at {issuer_url} (login route: {issuer_url}/login)", file=sys.stderr)
         elif auth_token:
-            app.add_middleware(TokenAuthMiddleware, secret_token=auth_token)
-            print(f"Token protection ACTIVE (use ?token={auth_token[:4]}***).", file=sys.stderr)
-        else:
-            print("WARNING: Running without authentication! Set MCP_AUTH_TOKEN or MCP_OAUTH_ENABLED in .env to secure.", file=sys.stderr)
-        print(f"Starting MCP SSE server on http://{args.host}:{args.port}/sse", file=sys.stderr)
-        uvicorn.run(app, host=args.host, port=args.port, log_level=workflow.settings.log_level.lower())
-    elif args.transport == "streamable-http":
-        import uvicorn
-        from starlette.middleware.cors import CORSMiddleware
-        app = mcp.streamable_http_app(host=args.host)
-        if enable_oauth:
-            configure_oauth_endpoints(app, issuer_url)
-            app.add_middleware(DefaultPublicClientAuthMethodMiddleware)
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            allow_credentials=True,
-            expose_headers=["*"],
-        )
-        if enable_oauth:
-            print(f"OAuth 2.0 Sign In ACTIVE at {issuer_url} (login route: {issuer_url}/login)", file=sys.stderr)
-        elif auth_token:
-            app.add_middleware(TokenAuthMiddleware, secret_token=auth_token)
-            print(f"Token protection ACTIVE (use ?token={auth_token[:4]}***).", file=sys.stderr)
-        else:
-            print("WARNING: Running without authentication! Set MCP_AUTH_TOKEN or MCP_OAUTH_ENABLED in .env to secure.", file=sys.stderr)
-        print(f"Starting MCP Streamable-HTTP server on http://{args.host}:{args.port}/mcp", file=sys.stderr)
-        uvicorn.run(app, host=args.host, port=args.port, log_level=workflow.settings.log_level.lower())
+            app.add_middleware(
+                TokenAuthMiddleware,
+                secret_token=auth_token,
+                allow_query_token=workflow.settings.allow_query_token,
+            )
+            print("Bearer token authentication ACTIVE.", file=sys.stderr)
+
+        endpoint_suffix = "sse" if args.transport == "sse" else "mcp"
+        print(f"Starting MCP {args.transport} server on http://{args.host}:{args.port}/{endpoint_suffix}", file=sys.stderr)
+        try:
+            uvicorn.run(app, host=args.host, port=args.port, log_level=workflow.settings.log_level.lower())
+        finally:
+            async def _cleanup_http():
+                await research_fetcher.aclose()
+                await research_search.aclose()
+                await research_router.aclose()
+                await _client.aclose()
+            try:
+                asyncio.run(_cleanup_http())
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

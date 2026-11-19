@@ -897,15 +897,19 @@ class Workflow:
 
     async def create_confirmed_record(self, confirmation_token: str, user_has_explicitly_confirmed: bool) -> dict[str, Any]:
         """Dispatch creation or update based on token op_type and entity_type."""
-        # Peek at staged operation to dispatch to the correct handler
-        slot = self.store._slot(confirmation_token.strip()) if confirmation_token else None
-        op = self.store._ops.get(slot) if slot else None
-        if op and op.op_type == "update":
-            return await self.update_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
-        if op and op.entity_type == "government_entity":
-            return await self.create_government_entity(confirmation_token, user_has_explicitly_confirmed)
-        if op and op.entity_type == "market_event":
-            return await self.create_market_event(confirmation_token, user_has_explicitly_confirmed)
+        try:
+            ident = await self._identity()
+        except ApiError as exc:
+            return self._create_fail([f"Authentication/role check failed: {exc}"])
+        meta = self.store.peek_operation_meta(confirmation_token, ident.key)
+        if meta is not None:
+            op_type, entity_type = meta
+            if op_type == "update":
+                return await self.update_confirmed_record(confirmation_token, user_has_explicitly_confirmed)
+            if entity_type == "government_entity":
+                return await self.create_government_entity(confirmation_token, user_has_explicitly_confirmed)
+            if entity_type == "market_event":
+                return await self.create_market_event(confirmation_token, user_has_explicitly_confirmed)
         return await self.create(confirmation_token, user_has_explicitly_confirmed)
 
 

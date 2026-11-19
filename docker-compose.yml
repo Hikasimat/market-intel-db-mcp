@@ -5,12 +5,19 @@ services:
     restart: unless-stopped
     command: ["python", "server.py", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8001"]
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     env_file:
       - .env
+    environment:
+      MCP_OAUTH_DB_PATH: /data/oauth.db
+      RESEARCH_CACHE_DB_PATH: /data/research_cache.db
+    volumes:
+      - mcp-data:/data
     healthcheck:
       test: ["CMD", "python", "server.py", "--check"]
       interval: 30s
       timeout: 10s
       retries: 3
 
+volumes:
+  mcp-data:

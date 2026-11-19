@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .git/
+*.db
+*.db-wal
+*.db-shm

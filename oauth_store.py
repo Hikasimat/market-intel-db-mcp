@@ -1,7 +1,9 @@
 """SQLite-based persistent storage for OAuth 2.0 clients, sessions, and tokens."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -11,11 +13,13 @@ from typing import Any
 from pydantic import AnyUrl
 
 from mcp.server.auth.provider import (
-    AccessToken,
-    AuthorizationCode,
     OAuthClientInformationFull,
-    RefreshToken,
 )
+
+
+def _hash_secret(value: str) -> str:
+    """Return a SHA-256 hex digest with prefix so secrets are not stored in plaintext."""
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -169,6 +173,17 @@ class OAuthStore:
                 WHERE token_endpoint_auth_method IS NULL
             """)
             conn.commit()
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _prune_expired(conn: sqlite3.Connection, now: float) -> None:
+        conn.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
+        conn.execute("DELETE FROM auth_codes WHERE expires_at <= ?", (now,))
+        conn.execute("DELETE FROM access_tokens WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
+        conn.execute("DELETE FROM refresh_tokens WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
 
     # ------------------------------------------------------------- Clients
     def save_client(self, client: OAuthClientInformationFull) -> None:
@@ -248,8 +263,10 @@ class OAuthStore:
         resource: str | None,
         ttl_seconds: int = 600,
     ) -> None:
-        expires_at = time.time() + ttl_seconds
+        now = time.time()
+        expires_at = now + ttl_seconds
         with self._get_connection() as conn:
+            self._prune_expired(conn, now)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO auth_sessions (
@@ -309,8 +326,11 @@ class OAuthStore:
         role: str = "PRE",
         is_superuser: bool = False,
     ) -> None:
-        expires_at = time.time() + ttl_seconds
+        now = time.time()
+        expires_at = now + ttl_seconds
+        code_key = _hash_secret(code)
         with self._get_connection() as conn:
+            self._prune_expired(conn, now)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO auth_codes (
@@ -320,7 +340,7 @@ class OAuthStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
-                    code,
+                    code_key,
                     client_id,
                     redirect_uri,
                     code_challenge,
@@ -336,14 +356,18 @@ class OAuthStore:
             conn.commit()
 
     def get_auth_code(self, code: str) -> StoredAuthCode | None:
+        hashed = _hash_secret(code)
         with self._get_connection() as conn:
-            cur = conn.execute("SELECT * FROM auth_codes WHERE code = ?", (code,))
+            cur = conn.execute(
+                "SELECT * FROM auth_codes WHERE code IN (?, ?)",
+                (hashed, code),
+            )
             row = cur.fetchone()
             if not row:
                 return None
             keys = row.keys()
             return StoredAuthCode(
-                code=row["code"],
+                code=code,
                 client_id=row["client_id"],
                 redirect_uri=row["redirect_uri"],
                 code_challenge=row["code_challenge"],
@@ -357,10 +381,15 @@ class OAuthStore:
                 is_superuser=bool(row["is_superuser"]) if "is_superuser" in keys and row["is_superuser"] is not None else False,
             )
 
-    def mark_auth_code_used(self, code: str) -> None:
+    def mark_auth_code_used(self, code: str) -> bool:
+        hashed = _hash_secret(code)
         with self._get_connection() as conn:
-            conn.execute("UPDATE auth_codes SET used = 1 WHERE code = ?", (code,))
+            cur = conn.execute(
+                "UPDATE auth_codes SET used = 1 WHERE code IN (?, ?) AND used = 0",
+                (hashed, code),
+            )
             conn.commit()
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------- Tokens
     def save_tokens(
@@ -373,16 +402,19 @@ class OAuthStore:
         resource: str | None,
         django_access_token: str,
         django_refresh_token: str | None,
-        access_token_ttl: int = 30 * 86400,  # 30 days
-        refresh_token_ttl: int = 90 * 86400,  # 90 days
+        access_token_ttl: int = 3600,
+        refresh_token_ttl: int = 7 * 86400,
         role: str = "PRE",
         is_superuser: bool = False,
     ) -> None:
         now = time.time()
         access_expires_at = now + access_token_ttl
         refresh_expires_at = now + refresh_token_ttl if refresh_token else None
+        at_key = _hash_secret(access_token)
+        rt_key = _hash_secret(refresh_token) if refresh_token else None
 
         with self._get_connection() as conn:
+            self._prune_expired(conn, now)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO access_tokens (
@@ -392,8 +424,8 @@ class OAuthStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    access_token,
-                    refresh_token,
+                    at_key,
+                    rt_key,
                     client_id,
                     json.dumps(scopes),
                     subject,
@@ -406,7 +438,7 @@ class OAuthStore:
                     1 if is_superuser else 0,
                 ),
             )
-            if refresh_token:
+            if rt_key:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO refresh_tokens (
@@ -416,8 +448,8 @@ class OAuthStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        refresh_token,
-                        access_token,
+                        rt_key,
+                        at_key,
                         client_id,
                         json.dumps(scopes),
                         subject,
@@ -433,14 +465,18 @@ class OAuthStore:
             conn.commit()
 
     def get_token_data(self, access_token: str) -> StoredTokenData | None:
+        hashed = _hash_secret(access_token)
         with self._get_connection() as conn:
-            cur = conn.execute("SELECT * FROM access_tokens WHERE token = ?", (access_token,))
+            cur = conn.execute(
+                "SELECT * FROM access_tokens WHERE token IN (?, ?)",
+                (hashed, access_token),
+            )
             row = cur.fetchone()
             if not row:
                 return None
             keys = row.keys()
             return StoredTokenData(
-                token=row["token"],
+                token=access_token,
                 refresh_token=row["refresh_token"],
                 client_id=row["client_id"],
                 scopes=json.loads(row["scopes_json"]) if row["scopes_json"] else [],
@@ -454,15 +490,19 @@ class OAuthStore:
             )
 
     def get_refresh_token_data(self, refresh_token: str) -> StoredTokenData | None:
+        hashed = _hash_secret(refresh_token)
         with self._get_connection() as conn:
-            cur = conn.execute("SELECT * FROM refresh_tokens WHERE token = ?", (refresh_token,))
+            cur = conn.execute(
+                "SELECT * FROM refresh_tokens WHERE token IN (?, ?)",
+                (hashed, refresh_token),
+            )
             row = cur.fetchone()
             if not row:
                 return None
             keys = row.keys()
             return StoredTokenData(
-                token=row["token"],
-                refresh_token=row["token"],
+                token=refresh_token,
+                refresh_token=refresh_token,
                 client_id=row["client_id"],
                 scopes=json.loads(row["scopes_json"]) if row["scopes_json"] else [],
                 subject=row["subject"],
@@ -480,40 +520,42 @@ class OAuthStore:
         new_django_access_token: str,
         new_django_refresh_token: str | None = None,
     ) -> None:
+        hashed = _hash_secret(mcp_access_token)
         with self._get_connection() as conn:
             if new_django_refresh_token:
                 conn.execute(
                     """
                     UPDATE access_tokens
                     SET django_access_token = ?, django_refresh_token = ?
-                    WHERE token = ?
+                    WHERE token IN (?, ?)
                     """,
-                    (new_django_access_token, new_django_refresh_token, mcp_access_token),
+                    (new_django_access_token, new_django_refresh_token, hashed, mcp_access_token),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE access_tokens
                     SET django_access_token = ?
-                    WHERE token = ?
+                    WHERE token IN (?, ?)
                     """,
-                    (new_django_access_token, mcp_access_token),
+                    (new_django_access_token, hashed, mcp_access_token),
                 )
             conn.commit()
 
     def revoke_token(self, token_str: str) -> None:
+        hashed = _hash_secret(token_str)
         with self._get_connection() as conn:
             # Delete from access_tokens and linked refresh token
-            cur = conn.execute("SELECT refresh_token FROM access_tokens WHERE token = ?", (token_str,))
+            cur = conn.execute("SELECT refresh_token FROM access_tokens WHERE token IN (?, ?)", (hashed, token_str))
             row = cur.fetchone()
             if row and row["refresh_token"]:
                 conn.execute("DELETE FROM refresh_tokens WHERE token = ?", (row["refresh_token"],))
-            conn.execute("DELETE FROM access_tokens WHERE token = ?", (token_str,))
+            conn.execute("DELETE FROM access_tokens WHERE token IN (?, ?)", (hashed, token_str))
 
             # Also delete if token_str was a refresh_token
-            cur = conn.execute("SELECT access_token FROM refresh_tokens WHERE token = ?", (token_str,))
+            cur = conn.execute("SELECT access_token FROM refresh_tokens WHERE token IN (?, ?)", (hashed, token_str))
             row = cur.fetchone()
             if row and row["access_token"]:
                 conn.execute("DELETE FROM access_tokens WHERE token = ?", (row["access_token"],))
-            conn.execute("DELETE FROM refresh_tokens WHERE token = ?", (token_str,))
+            conn.execute("DELETE FROM refresh_tokens WHERE token IN (?, ?)", (hashed, token_str))
             conn.commit()

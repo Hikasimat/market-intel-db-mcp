@@ -490,25 +490,22 @@ async def test_login_rejects_non_pre_role(dummy_settings, tmp_store):
 
 @pytest.mark.asyncio
 async def test_cors_preflight_on_mcp_and_token(dummy_settings, tmp_store):
-    """Verify CORS preflight OPTIONS requests return 200 OK with allowed origins and headers."""
+    """Verify explicit CORS allowlist permits configured origin and blocks wildcard credentials."""
     from confirmation_store import ConfirmationStore
     from workflow import Workflow
     from api_client import MarketIntelClient
-    from server import create_mcp
-    from starlette.middleware.cors import CORSMiddleware
+    from config import ConfigError
+    from server import configure_cors, create_mcp
 
     client_mock = MarketIntelClient(dummy_settings)
     wf = Workflow(client_mock, ConfirmationStore(300), dummy_settings)
     mcp = create_mcp(lambda: wf)
     app = mcp.streamable_http_app()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        allow_credentials=True,
-        expose_headers=["*"],
-    )
+
+    with pytest.raises(ConfigError, match="wildcard"):
+        configure_cors(app, ("*",))
+
+    configure_cors(app, ("https://claude.ai",))
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http_client:
         res = await http_client.options(
@@ -520,5 +517,43 @@ async def test_cors_preflight_on_mcp_and_token(dummy_settings, tmp_store):
             },
         )
         assert res.status_code == 200
-        assert res.headers.get("access-control-allow-origin") == "https://claude.ai" or res.headers.get("access-control-allow-origin") == "*"
+        assert res.headers.get("access-control-allow-origin") == "https://claude.ai"
+
+        res_bad = await http_client.options(
+            "/mcp",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization,Content-Type",
+            },
+        )
+        assert res_bad.headers.get("access-control-allow-origin") is None
+
+
+@pytest.mark.asyncio
+async def test_oauth_cimd_ssrf_and_token_hashing(provider, tmp_store):
+    """Verify CIMD rejects non-HTTPS/private URLs and OAuthStore hashes tokens at rest."""
+    assert await provider.get_client("http://claude.ai/meta.json") is None
+    assert await provider.get_client("https://127.0.0.1/meta.json") is None
+    assert await provider.get_client("https://169.254.169.254/latest/meta-data/") is None
+
+    # Save tokens and verify plaintext secret is not stored in SQLite.
+    tmp_store.save_tokens(
+        access_token="mcp_at_secret_plain",
+        refresh_token="mcp_rt_secret_plain",
+        client_id="cid-1",
+        scopes=[],
+        subject="1:pre_user",
+        resource="https://mcp.example.com",
+        django_access_token="dj_at",
+        django_refresh_token="dj_rt",
+    )
+    import sqlite3
+    with sqlite3.connect(tmp_store.db_path) as conn:
+        rows = conn.execute("SELECT token FROM access_tokens").fetchall()
+        assert rows and all(r[0].startswith("sha256:") for r in rows)
+        assert all("mcp_at_secret_plain" not in r[0] for r in rows)
+
+    loaded = tmp_store.get_token_data("mcp_at_secret_plain")
+    assert loaded is not None and loaded.subject == "1:pre_user"
 

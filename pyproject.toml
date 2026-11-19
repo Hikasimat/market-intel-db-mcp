@@ -1,7 +1,7 @@
 [project]
 name = "market-intel-prospect-entry-server"
-version = "0.1.0"
-description = "Restricted MCP server for entering new prospects into Market Intel DB via its existing Django API"
+version = "0.2.0"
+description = "Restricted MCP server for evidence-based company/event research and confirmed entry into Market Intel DB"
 requires-python = ">=3.11"
 dependencies = [
   "mcp==2.3.0",
@@ -20,4 +20,4 @@ asyncio_mode = "auto"
 markers = ["integration: needs a real test backend (MI_INTEGRATION=1); never run against production"]
 
 [tool.setuptools]
-py-modules = []
+packages = ["research"]

@@ -1,8 +1,14 @@
 import pytest
 
-from config import ConfigError, load_settings
-from server import create_mcp
+from config import ConfigError, Settings, load_settings
 from conftest import valid_prospect
+from research.cache import SQLiteResearchCache
+from research.fetcher import SafeFetcher
+from research.provider_router import ProviderRouter
+from research.search import SearchClient
+from research.service import ResearchService
+from research.vortexen_profile import VortexenProfileManager
+from server import create_mcp
 
 EXPECTED = {
     "get_prospect_blueprint",
@@ -20,37 +26,45 @@ EXPECTED = {
     "create_confirmed_record",
     "validate_record_update",
     "update_confirmed_record",
-    "connect_whatsapp",
-    "get_whatsapp_connection_status",
-    "get_whatsapp_qr_code",
-    "disconnect_whatsapp",
-    "list_whatsapp_chats",
-    "get_whatsapp_chat_history",
-    "get_whatsapp_contact_details",
-    "search_whatsapp_messages",
-    "send_whatsapp_message",
-    "send_whatsapp_media",
-    "mark_whatsapp_chat_read",
-    "sync_whatsapp_history",
-    "get_whatsapp_incoming_messages",
-    "edit_whatsapp_message",
-    "forward_whatsapp_message",
-    "create_whatsapp_group",
-    "manage_whatsapp_group_participants",
-    "get_whatsapp_group_invite_link",
-    "link_whatsapp_conversation_to_contact",
+    "research_company_prospect",
+    "research_market_event",
+    "get_research_cache_status",
+    "refresh_vortexen_profile",
 }
 
 
 @pytest.fixture
-def mcp(wf):
-    return create_mcp(lambda: wf)
+def mcp(wf, tmp_path):
+    s = Settings(
+        api_base_url=wf.settings.api_base_url,
+        username=wf.settings.username,
+        password=wf.settings.password,
+        research_cache_db_path=tmp_path / "mcp_research.db",
+        search_provider="none",
+    )
+    cache = SQLiteResearchCache(s.research_cache_db_path)
+    fetcher = SafeFetcher(s, cache=cache)
+    search_c = SearchClient(s)
+    router = ProviderRouter(s, cache=cache)
+    vx = VortexenProfileManager(s, fetcher, cache=cache, router=router)
+    rs = ResearchService(
+        wf.client,
+        wf,
+        s,
+        cache=cache,
+        fetcher=fetcher,
+        search_client=search_c,
+        router=router,
+        vortexen_manager=vx,
+    )
+    return create_mcp(lambda: wf, get_research_service=lambda: rs)
 
 
 async def test_tools_registered_and_forbidden_actions_absent(mcp):
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
     assert names == EXPECTED
+    assert not [n for n in names if "whatsapp" in n.lower()]
     forbidden = ("delete", "remove", "destroy", "drop", "bulk", "batch", "import", "request", "http", "shell", "exec")
     assert not [n for n in names if any(f in n.lower() for f in forbidden)]
 
@@ -73,6 +87,23 @@ async def test_end_to_end_through_mcp_tools(mcp, client):
     c = data(await mcp.call_tool("create_confirmed_prospect", {
         "confirmation_token": v["confirmation_token"], "user_has_explicitly_confirmed": True}))
     assert c["created"] and client.count("create") == 1
+
+
+async def test_research_tools_are_strictly_read_only(mcp, client):
+    def data(res):
+        s = res.structured_content
+        assert not res.is_error, res
+        return s.get("result", s) if set(s) == {"result"} else s
+
+    cache_st = data(await mcp.call_tool("get_research_cache_status", {}))
+    assert cache_st["ok"] and cache_st["read_only"]
+
+    res = data(await mcp.call_tool("research_company_prospect", {"company_name": "Unknown Test Co"}))
+    assert res["ok"] and res["read_only"] is True
+    assert client.count("create") == 0
+    assert client.count("create_gov") == 0
+    assert client.count("create_event") == 0
+    assert client.count("update_prospect") == 0
 
 
 def test_config_missing_values_readable(monkeypatch, tmp_path):
