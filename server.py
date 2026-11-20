@@ -669,6 +669,8 @@ def main() -> None:
         "vortexen": vortexen_mgr,
     }
 
+    _refresh_locks: dict[str, asyncio.Lock] = {}
+
     def _build_oauth_client() -> MarketIntelClient | None:
         if oauth_store:
             from mcp.server.auth.middleware.auth_context import get_access_token
@@ -687,12 +689,26 @@ def main() -> None:
                     async def on_refresh(new_acc: str, new_ref: str | None = None) -> None:
                         oauth_store.update_django_tokens(access_tok.token, new_acc, new_ref)
 
+                    def reload_tokens() -> tuple[str, str | None] | None:
+                        fresh = oauth_store.get_token_data(access_tok.token)
+                        if not fresh:
+                            return None
+                        return fresh.django_access_token, fresh.django_refresh_token
+
+                    lock = _refresh_locks.setdefault(access_tok.token, asyncio.Lock())
+                    if len(_refresh_locks) > 256:
+                        for k in list(_refresh_locks)[:128]:
+                            if k != access_tok.token and not _refresh_locks[k].locked():
+                                _refresh_locks.pop(k, None)
+
                     return MarketIntelClient(
                         workflow.settings,
                         access_token=token_data.django_access_token,
                         refresh_token=token_data.django_refresh_token,
                         identity=ident,
                         on_token_refreshed=on_refresh,
+                        reload_tokens=reload_tokens,
+                        refresh_lock=lock,
                     )
         return None
 

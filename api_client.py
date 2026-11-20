@@ -150,6 +150,8 @@ class MarketIntelClient:
         refresh_token: str | None = None,
         identity: Identity | None = None,
         on_token_refreshed: Any = None,
+        reload_tokens: Any = None,
+        refresh_lock: asyncio.Lock | None = None,
     ):
         self._s = settings
         # One pooled client + cookie jar so the cookie-based refresh flow works.
@@ -162,6 +164,10 @@ class MarketIntelClient:
         self._token: str | None = access_token
         self._refresh_token: str | None = refresh_token
         self._on_token_refreshed = on_token_refreshed
+        # reload_tokens() -> (access, refresh) | None: latest tokens from the shared store, so a
+        # concurrent call that already rotated the refresh token is adopted instead of failing.
+        self._reload_tokens = reload_tokens
+        self._refresh_lock = refresh_lock
         self._token_only: bool = bool(access_token)
         self._auth_lock = asyncio.Lock()
         self.identity: Identity | None = identity
@@ -254,7 +260,28 @@ class MarketIntelClient:
             raise
 
     async def _reauthenticate(self) -> None:
+        if self._refresh_lock is not None:
+            async with self._refresh_lock:
+                await self._reauthenticate_locked()
+        else:
+            await self._reauthenticate_locked()
+
+    async def _reauthenticate_locked(self) -> None:
+        stale = self._token
         self._token = None
+        if self._reload_tokens:
+            try:
+                latest = self._reload_tokens()
+                if asyncio.iscoroutine(latest):
+                    latest = await latest
+            except Exception:
+                latest = None
+            if latest and latest[0] and latest[0] != stale:
+                # Another request already refreshed; adopt its tokens.
+                self._token = latest[0]
+                if latest[1]:
+                    self._refresh_token = latest[1]
+                return
         try:
             body = {"refresh": self._refresh_token} if self._refresh_token else {}
             data = await self._send("POST", "/auth/refresh/", auth=False, body=body)
@@ -267,8 +294,8 @@ class MarketIntelClient:
                     if asyncio.iscoroutine(res):
                         await res
                 return
-        except ApiError:
-            pass
+        except ApiError as exc:
+            log.warning("Market Intel token refresh failed (HTTP %s)", exc.status)
         if not self._token_only and self._s.username and self._s.password:
             await self._login()
         else:
